@@ -1,0 +1,1 @@
+@include('domestic.admin.dashboard')

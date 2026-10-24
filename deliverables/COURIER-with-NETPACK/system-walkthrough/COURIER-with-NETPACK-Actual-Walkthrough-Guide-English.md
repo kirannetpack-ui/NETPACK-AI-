@@ -1,0 +1,46 @@
+# COURIER with NETPACK — Actual System Walkthrough
+
+This film uses recorded interactions with the real Laravel application and an isolated demonstration database. It is not a slide presentation. No staging or production records were changed.
+
+## Master film sequence
+
+1. **cover** — Welcome to COURIER with NETPACK, a door-to-door logistics technology platform designed to connect customers, merchants, riders, partners, agencies and administrators through one trusted delivery history.
+2. **portfolio** — The platform supports three primary service categories: international courier, domestic courier across Nepal, and e-commerce or on-demand delivery. Supporting services reuse the same identity, tracking and operational controls.
+3. **door flow** — Every service follows one connected chain: request, address validation, quotation, pickup, custody handoffs, transit or live tracking, recipient verification, proof of delivery and final financial closure.
+4. **registration** — Public registration is available for customers, sellers, riders and domestic partners. Administrative, agency and overseas accounts use controlled creation or approval. The assigned role determines dashboard access and data visibility.
+5. **international** — International courier starts with origin, destination, parcel measurements and service selection. It continues through rate and surcharge calculation, HAWB and labels, partner scans, unified tracking and exception or delivery completion.
+6. **international pricing** — International pricing compares actual weight with volumetric weight to determine chargeable weight. Partner cost, fuel, remote area, insurance, handling, discounts and operating margin must be included before confirming the customer price.
+7. **international compliance** — International bookings also require clear commodity descriptions, declared value, identity, invoices, required documents and restricted-goods review. Current document and scan workflows exist, while a complete country rules engine needs verified external data.
+8. **domestic** — Domestic courier uses Nepal-specific addressing, delivery zones and partner rates. A pickup becomes a shipment, moves through a manifest and scan history, and closes with proof of delivery and settlement.
+9. **domestic orchestration** — The current platform can store zones, partners and rates. The future orchestration layer should select the best eligible partner using coverage, price, service level, capacity, performance and COD availability.
+10. **remote surcharge** — Remote-area decisions must identify the carrier or data source, the matching condition, the surcharge and the last update date. Official carrier data is preferred, with a clearly labeled manual fallback when live data is unavailable.
+11. **ecommerce** — E-commerce and on-demand delivery connect seller orders to rider execution. The rider accepts a job, verifies pickup, shares active location, verifies the recipient, handles permitted COD and completes proof of delivery.
+12. **ecommerce pricing dispatch** — Professional on-demand operations require both sound pricing and intelligent dispatch. Price considers distance, time, vehicle, parcel, priority and fees, while dispatch considers availability, road time, workload, compatibility and reassignment rules.
+13. **additional services** — The platform also includes a grocery-box experience, agency and branch operations, and operational reporting. These services use the same account, tracking, notification and audit foundations.
+14. **labels scanning** — Tracking numbers, HAWB labels, barcodes and QR codes connect the physical parcel to the digital record. Each authorized scan should validate the shipment and create a traceable custody or status event.
+15. **payments comms** — Payment and communication complete the service loop. The platform contains payment verification routes, COD and wallet workflows, in-app notifications, chat, support and feedback. Live providers require production credentials and callbacks.
+16. **customer access** — Customers can self-register and, after approval, access booking, pickup, tracking, payment and support features. Managed client accounts can be created by an administrator for corporate service.
+17. **customer flow** — The customer journey is intentionally simple: register, choose a service, enter accurate parcel and address information, confirm the quotation, follow tracking updates and receive the shipment with authorized proof.
+18. **merchant access** — Merchants and sellers manage products, orders, shipments, labels, invoices, tracking, support, earnings, wallets and payouts. Approval activates the seller workspace and protects merchant-specific data.
+19. **merchant flow** — A merchant creates the order, prepares the label, arranges pickup, monitors rider or partner handling, resolves exceptions and reconciles COD or payout only after verified delivery.
+20. **rider access** — Riders register with identity, licence and vehicle information. Once approved, they manage availability, jobs, active location, delivery status, COD eligibility, earnings, wallet and deposit history.
+21. **rider flow** — The rider goes online, accepts an eligible job, navigates to pickup, verifies the parcel, updates transit status, verifies the recipient, collects permitted COD and closes with proof of delivery.
+22. **partner access** — Domestic partners work within assigned coverage, rates, manifests, deliveries and staff permissions. In-app notifications provide a fallback when no live partner integration is configured.
+23. **partner flow** — A partner receives a manifest, scans and processes shipments, dispatches them for delivery, captures proof or an exception, and may forward or re-manifest only with authorization and a complete audit history.
+24. **overseas access** — Overseas partners and their staff use controlled access to assigned international shipments, hubs, transit points, documents and scan actions. Live carrier automation is not assumed without credentials and contracts.
+25. **overseas flow** — Each overseas custody change should be scanned: origin hub, transit, destination hub and final delivery partner. Partner events are mapped into one customer-friendly tracking history while preserving original timestamps.
+26. **agency access** — Agency and corporate branch access is controlled. Agency administrators manage individual staff accounts, while customer and shipment data remain scoped to the authorized agency.
+27. **agency flow** — The agency journey begins with controlled access, then customer intake, shipment creation, network handoff, tracking and ongoing customer support. Every staff action remains attributable to the staff member and branch.
+28. **admin access** — Administrators are the approval and control layer. Super administrators, service administrators, operations staff and finance users receive only the permissions required for their responsibilities.
+29. **admin flow** — Administration approves identities, configures services and pricing, monitors operations, resolves exceptions, verifies proof and COD, completes settlement and audits high-risk access or state changes.
+30. **control tower** — Tracking, proof of delivery and COD are the operational control tower. One shipment identity must connect every event, proof record and financial movement without duplicate completion or settlement.
+31. **exceptions returns** — Exceptions must never disappear into free text. Failed pickup, transit delay, damage, loss, customs hold, unavailable recipients, wrong addresses and returns each need a reason, owner, next action, notification and service clock.
+32. **nepal** — Nepal serviceability needs province, district, municipality or rural municipality, ward, locality, landmark, GPS pin and reliable phone contacts. The design must also tolerate difficult geography and variable mobile connectivity.
+33. **security data** — Security protects customers, operations and cash. Accounts are approved and role-scoped, high-risk transitions are controlled, sensitive proof and registration data are restricted, and secrets remain outside Git and user-facing materials.
+34. **readiness** — The platform already contains substantial application workflows. Manual configuration remains important for rates, partners and remote data. Payments, maps, messaging and carrier integrations require external activation, and advanced automation remains future work.
+35. **future** — The roadmap begins with reliable deployment and operational controls, then adds carrier integrations, partner scoring, merchant APIs and stronger dispatch, before expanding toward national orchestration, fulfillment, practical AI and regional corridors.
+36. **close** — COURIER with NETPACK aims to deliver one booking, one connected network and one trusted delivery history. The next step is evidence-based staging validation followed by controlled activation and production promotion.
+
+## Accuracy and activation note
+
+The recordings show interfaces and flows present in the current codebase. Live carrier APIs, road routing, payment providers, messaging providers, predictive ETA and AI optimisation require approved credentials, contracts, configuration and production data before they can be represented as active capabilities.

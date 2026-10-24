@@ -1,0 +1,235 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Shipment;
+use App\Services\AiAssistantService;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\View\View;
+
+class AiAssistantController extends Controller
+{
+    protected AiAssistantService $aiService;
+
+    public function __construct(AiAssistantService $aiService)
+    {
+        $this->aiService = $aiService;
+    }
+
+    /**
+     * Display the Full-Screen AI Logistics Copilot & Interactive Command Center
+     */
+    public function index(Request $request): View
+    {
+        $user = $request->user();
+        $greetingData = $this->aiService->generateGreeting($user);
+        $occasions = config('ai_assistant.occasions', []);
+        $schedules = config('ai_assistant.schedules', []);
+
+        return view('ai.index', compact('greetingData', 'occasions', 'schedules', 'user'));
+    }
+
+    /**
+     * Fetch dynamic greeting with gestures and festival notices
+     */
+    public function greeting(Request $request): JsonResponse
+    {
+        $data = $this->aiService->generateGreeting($request->user());
+
+        return response()->json([
+            'success' => true,
+            'data' => $data,
+        ]);
+    }
+
+    /**
+     * Process AI Chat & Voice Query
+     */
+    public function chat(Request $request): JsonResponse
+    {
+        $request->validate([
+            'message' => 'required|string|max:2000',
+            'history' => 'nullable|array|max:20',
+            'history.*.role' => 'required|in:user,assistant',
+            'history.*.content' => 'required|string|max:2000',
+        ]);
+
+        $query = $request->input('message');
+        $history = $request->input('history', []);
+        $user = $request->user();
+
+        $result = $this->aiService->ask($query, $user, $history);
+
+        return response()->json($result);
+    }
+
+    /**
+     * Get list of upcoming occasions, festivals, and operational logistics schedules
+     */
+    public function occasions(Request $request): JsonResponse
+    {
+        $occasions = config('ai_assistant.occasions', []);
+        $schedules = config('ai_assistant.schedules', []);
+        $nearest = $this->aiService->getNearestOccasion();
+
+        return response()->json([
+            'success' => true,
+            'occasions' => $occasions,
+            'schedules' => $schedules,
+            'current_occasion' => $nearest,
+        ]);
+    }
+
+    /**
+     * Parse and structure spoken voice text for form field auto-typing
+     */
+    public function voiceAutofillParse(Request $request): JsonResponse
+    {
+        $request->validate([
+            'step' => 'required|string',
+            'spoken_text' => 'required|string|max:1000',
+            'mode' => 'nullable|string',
+        ]);
+
+        $step = $request->input('step');
+        $text = $request->input('spoken_text');
+        $mode = $request->input('mode', 'domestic');
+
+        $result = $this->aiService->parseVoiceFormField($step, $text, $mode);
+
+        return response()->json([
+            'success' => true,
+            'data' => $result,
+        ]);
+    }
+
+    /**
+     * Fetch active operational intelligence exceptions and Win-Win-Win suggestions for Admins
+     */
+    public function adminOperationalIntelligence(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        if (! $user || ! in_array($user->user_type, ['super_admin', 'admin'], true)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthorized access to operational intelligence.',
+            ], 403);
+        }
+
+        $issues = $this->aiService->getAdminOperationalIssuesAndWinWinSolutions();
+        $clientInfo = $this->aiService->resolveClientName($user, 'operational status');
+        $report = $this->aiService->generateAdminOperationalIntelligenceReport($clientInfo, 'status');
+
+        return response()->json([
+            'success' => true,
+            'issues' => $issues,
+            'report' => $report,
+            'critical_count' => count(array_filter($issues, fn ($i) => ($i['severity'] ?? '') === 'critical')),
+            'warning_count' => count(array_filter($issues, fn ($i) => ($i['severity'] ?? '') === 'warning')),
+        ]);
+    }
+
+    /**
+     * Execute 1-Click Win-Win-Win Operational Action from Admin Panel
+     */
+    public function adminResolveIssueAction(Request $request): JsonResponse
+    {
+        abort_unless($request->user() && in_array($request->user()->user_type, ['super_admin', 'admin'], true), 403);
+        $request->validate([
+            'issue_id' => 'required|string',
+            'action_type' => 'required|string',
+            'shipment_id' => 'nullable|integer',
+            'notes' => 'nullable|string|max:1000',
+        ]);
+
+        $result = $this->aiService->executeAdminWinWinAction(
+            $request->input('issue_id'),
+            $request->input('action_type'),
+            $request->input('shipment_id'),
+            $request->input('notes')
+        );
+
+        return response()->json($result);
+    }
+
+    /**
+     * Stream natural high-clarity neural audio text-to-speech for Chanda voice
+     */
+    public function streamSpeech(Request $request)
+    {
+        $request->validate(['text' => 'nullable|string|max:2000']);
+        $text = trim($request->input('text', ''));
+        if (empty($text)) {
+            return response('', 204);
+        }
+
+        // Available accents:
+        // 'en-IN' -> Authentic South Asian / Nepalese English (polite, warm, familiar pronunciation) - DEFAULT
+        // 'ne-NP' / 'ne' -> Native Nepali
+        // 'en-GB' -> British International
+        // 'en-US' -> American English
+        $accent = $request->input('accent', 'en-IN');
+        $validAccents = ['en-IN', 'ne-NP', 'ne', 'hi-IN', 'en-GB', 'en-US'];
+        if (! in_array($accent, $validAccents)) {
+            $accent = 'en-IN';
+        }
+
+        $audioData = $this->aiService->generateSpeechAudio($text, $accent);
+        if ($audioData) {
+            return response($audioData, 200, [
+                'Content-Type' => 'audio/mpeg',
+                'Cache-Control' => 'private, no-store',
+                'Content-Length' => strlen($audioData),
+                'Accept-Ranges' => 'bytes',
+            ]);
+        }
+
+        return response()->json(['error' => 'TTS audio stream temporarily unavailable'], 502);
+    }
+
+    /**
+     * 3-Tap Zero-Form Dispatch Parser for Web & Mobile App
+     */
+    public function fastDispatchParse(Request $request): JsonResponse
+    {
+        $request->validate([
+            'query' => 'required|string|max:1000',
+        ]);
+
+        $query = $request->input('query');
+        $user = $request->user();
+
+        $result = $this->aiService->parseFastDispatch($query, $user);
+
+        return response()->json($result);
+    }
+
+    /**
+     * 4-Pillar AI Status Explainer for Tracking & Consignment History
+     */
+    public function explainStatus(Request $request): JsonResponse
+    {
+        $request->validate([
+            'status' => 'required|string|max:50',
+            'tracking_number' => 'nullable|string|max:50',
+        ]);
+
+        $status = $request->input('status');
+        $trackingNumber = $request->input('tracking_number');
+
+        $shipment = null;
+        if ($trackingNumber) {
+            $shipment = Shipment::where('tracking_number', $trackingNumber)
+                ->orWhere('hawb_number', $trackingNumber)
+                ->first();
+        }
+
+        $result = $this->aiService->explainShipmentStatus($status, $shipment);
+
+        return response()->json([
+            'success' => true,
+            'data' => $result,
+        ]);
+    }
+}

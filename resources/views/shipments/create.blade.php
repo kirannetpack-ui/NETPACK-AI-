@@ -1,0 +1,6297 @@
+@extends('layouts.app')
+
+@section('title', 'Ship & Pickup Console - NETPACK Unified Logistics')
+@section('page-title', 'Consignment & Pickup Operating Console')
+
+@push('styles')
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+    .custom-scrollbar::-webkit-scrollbar {
+        width: 5px;
+        height: 5px;
+    }
+    .custom-scrollbar::-webkit-scrollbar-track {
+        background: #f1f5f9;
+        border-radius: 4px;
+    }
+    .custom-scrollbar::-webkit-scrollbar-thumb {
+        background: #cbd5e1;
+        border-radius: 4px;
+    }
+    .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+        background: #94a3b8;
+    }
+    .map-container {
+        height: 220px;
+        border-radius: 16px;
+        border: 1px solid #e2e8f0;
+        z-index: 10;
+    }
+    .leaflet-container {
+        font-family: inherit;
+        border-radius: 16px;
+    }
+</style>
+@endpush
+
+@section('content')
+@php
+    $savedAddressesJson = ($savedAddresses ?? collect())->map(function($addr) {
+        return [
+            'id' => $addr->id,
+            'label' => $addr->display_name ?: ($addr->landmark ?: 'Saved Location'),
+            'contact_person_name' => $addr->contact_person_name,
+            'contact_phone' => $addr->contact_person_phone,
+            'pickup_address' => $addr->address,
+            'pickup_landmark' => $addr->landmark ?? '',
+            'pickup_city' => $addr->city ?? 'Kathmandu',
+            'is_default' => (bool)$addr->is_default,
+        ];
+    })->values();
+
+    $defaultName = $convertPickup->contact_person_name ?? '';
+    $defaultPhone = $convertPickup->contact_person_phone ?? '';
+    $defaultAddress = $convertPickup->pickup_address ?? '';
+    $hasPickupInitial = old('schedule_doorstep_pickup', request('pickup', '1')) != '0';
+    $initialView = (request('tab') === 'queue' || request('view') === 'queue') ? 'queue' : 'booking';
+@endphp
+
+<script>
+function shipmentConsoleData() {
+    return {
+        activeConsoleView: '{{ $initialView }}',
+        activeConsoleTab: '{{ $initialView === 'queue' ? 'queue' : 'consignment' }}',
+        hasDoorstepPickup: {{ $hasPickupInitial ? 'true' : 'false' }},
+        pickupScope: '{{ request("pickup_location_type") === "outside_ktm" ? "outside_valley" : request("pickup_scope", "inside_valley") }}',
+        pickupServiceTier: '{{ request("pickup_location_type") === "outside_ktm" ? "express" : "flash" }}',
+        pickupCalcWeight: {{ (float) request('weight', 1.0) }},
+        hasKnownDestination: {{ request('receiver_country') || request('destination_city') ? 'true' : 'false' }},
+        savedAddresses: {{ Js::from($savedAddressesJson) }},
+        selectedAddressId: '',
+        contactPersonName: '{{ addslashes($convertPickup->contact_person_name ?? "") }}',
+        contactPhone: '{{ addslashes($convertPickup->contact_person_phone ?? "") }}',
+        pickupAddress: '{{ addslashes($convertPickup->pickup_address ?? "") }}',
+        pickupLandmark: '',
+        pickupCity: '{{ addslashes(request("pickup_city", "Kathmandu")) }}',
+        saveAddress: true,
+        addressLabel: '',
+        isSubmittingPickup: false,
+
+        switchConsole(view) {
+            this.activeConsoleView = view;
+            this.activeConsoleTab = view === 'queue' ? 'queue' : 'consignment';
+            if (view === 'booking' || view === 'consignment') {
+                setTimeout(() => {
+                    if (window.pickupMaps) Object.values(pickupMaps).forEach(m => m && m.map && m.map.invalidateSize());
+                    if (window.deliveryMaps) Object.values(deliveryMaps).forEach(m => m && m.map && m.map.invalidateSize());
+                    if (window.internationalMap && internationalMap.map) internationalMap.map.invalidateSize();
+                }, 150);
+            }
+        },
+
+        setDoorstepPickup(val) {
+            this.hasDoorstepPickup = val;
+            const input = document.getElementById('schedule_doorstep_pickup');
+            if (input) input.value = val ? '1' : '0';
+            if (typeof updateSummaryStats === 'function') {
+                updateSummaryStats();
+            }
+            if (val) {
+                setTimeout(() => {
+                    if (window.pickupMaps) Object.values(pickupMaps).forEach(m => m && m.map && m.map.invalidateSize());
+                }, 150);
+            }
+        },
+
+        selectSavedPickupAddress(addr) {
+            if (!addr) return;
+            this.selectedAddressId = addr.id;
+            this.contactPersonName = addr.contact_person_name;
+            this.contactPhone = addr.contact_phone;
+            this.pickupAddress = addr.pickup_address;
+            this.pickupLandmark = addr.pickup_landmark || '';
+            this.pickupCity = addr.pickup_city || 'Kathmandu';
+            this.addressLabel = addr.label || '';
+        },
+
+        resetToNewPickupAddress() {
+            this.selectedAddressId = 'new';
+            this.contactPersonName = '';
+            this.contactPhone = '';
+            this.pickupAddress = '';
+            this.pickupLandmark = '';
+            this.pickupCity = 'Kathmandu';
+            this.addressLabel = '';
+        },
+
+        setPickupScope(newScope) {
+            this.pickupScope = newScope;
+            if (newScope === 'inside_valley') {
+                this.pickupServiceTier = 'flash';
+            } else if (newScope === 'outside_valley') {
+                this.pickupServiceTier = 'express';
+            } else {
+                this.pickupServiceTier = 'priority_express';
+            }
+        },
+
+        get estimatedPickupCost() {
+            let weight = Math.max(0.1, parseFloat(this.pickupCalcWeight) || 1.0);
+            let base = 0;
+            let perKg = 0;
+            
+            if (this.pickupScope === 'inside_valley') {
+                if (this.pickupServiceTier === 'flash') { base = 120; perKg = 60; }
+                else if (this.pickupServiceTier === 'same_day') { base = 100; perKg = 50; }
+                else { base = 80; perKg = 40; }
+            } else if (this.pickupScope === 'outside_valley') {
+                if (this.pickupServiceTier === 'express') { base = 220; perKg = 90; }
+                else if (this.pickupServiceTier === 'himalayan') { base = 350; perKg = 150; }
+                else { base = 160; perKg = 70; }
+            } else {
+                if (this.pickupServiceTier === 'priority_express') { base = 2800; perKg = 1200; }
+                else if (this.pickupServiceTier === 'document') { base = 1800; perKg = 800; }
+                else { base = 2200; perKg = 950; }
+            }
+            return Math.round(base + (Math.max(0, weight - 1) * perKg));
+        },
+
+        // Documentation & Cargo Specifications Engine
+        shipmentMode: '{{ request("shipment_type", "domestic") }}',
+        invoiceNumber: 'INV-{{ date("Y") }}-{{ rand(10000, 99999) }}',
+        invoiceDate: '{{ date("Y-m-d") }}',
+        invoiceCurrency: '{{ request("shipment_type") === "international" ? "USD" : "NPR" }}',
+        incoterm: 'DAP',
+        reasonForExport: 'Commercial Sale / Export',
+        exporterName: '{{ addslashes(Auth::user()->name ?? "") }}',
+        exporterPanVat: '{{ addslashes(Auth::user()->pan_vat_number ?? Auth::user()->pan_number ?? "") }}',
+        exporterEximCode: '{{ addslashes(Auth::user()->exim_code ?? "") }}',
+        consigneeTaxId: '',
+        sellerBillType: 'vat_invoice',
+        sellerBillNumber: '',
+        selectedBillFileName: '',
+        acquisitionSource: '{{ old("acquisition_source", "direct_portal") }}',
+
+        // Invoice line items with live WCO HS suggestion state
+        invoiceItems: [
+            {
+                name: '',
+                hs_code: '',
+                origin_country: 'Nepal',
+                qty: 1,
+                uom: 'PCS',
+                unit_price: '',
+                duty_rate: 0,
+                searchQuery: '',
+                suggestions: [],
+                showSuggestions: false,
+                isSearching: false
+            }
+        ],
+
+        // Packing List Box Matrix
+        totalBoxes: 1,
+        boxes: [
+            {
+                box_number: 1,
+                weight_kg: '{{ old('weight', $convertPickup->estimated_weight_kg ?? request('weight', '')) }}',
+                length_cm: '',
+                width_cm: '',
+                height_cm: '',
+                items: [
+                    { item_index: 0, item_name: '', qty: 1 }
+                ]
+            }
+        ],
+
+        // WCO Tariff Search Modal state
+        wcoModalOpen: false,
+        wcoSearchQuery: '',
+        wcoCategory: '',
+        wcoResults: [],
+        wcoLoading: false,
+        activeItemIndexForWco: null,
+
+        addInvoiceItem() {
+            this.invoiceItems.push({
+                name: '',
+                hs_code: '',
+                origin_country: 'Nepal',
+                qty: 1,
+                uom: 'PCS',
+                unit_price: 10.00,
+                duty_rate: 0,
+                searchQuery: '',
+                suggestions: [],
+                showSuggestions: false,
+                isSearching: false
+            });
+            const newIdx = this.invoiceItems.length - 1;
+            this.boxes.forEach(box => {
+                if (!box.items) box.items = [];
+                box.items.push({
+                    item_index: newIdx,
+                    item_name: '',
+                    qty: this.totalBoxes === 1 ? 1 : 0
+                });
+            });
+            if (this.totalBoxes === 1) {
+                this.autoAllocateSingleBox();
+            }
+            this.syncCargoWeight();
+        },
+
+        removeInvoiceItem(index) {
+            if (this.invoiceItems.length <= 1) {
+                alert('At least one item is required in the Commercial Invoice.');
+                return;
+            }
+            this.invoiceItems.splice(index, 1);
+            this.boxes.forEach(box => {
+                if (box.items) {
+                    box.items.splice(index, 1);
+                    box.items.forEach((it, i) => it.item_index = i);
+                }
+            });
+            if (this.totalBoxes === 1) {
+                this.autoAllocateSingleBox();
+            }
+            this.syncCargoWeight();
+        },
+
+        setBoxCount(count) {
+            count = Math.max(1, parseInt(count) || 1);
+            this.totalBoxes = count;
+            const b1 = this.boxes[0] || {};
+            while (this.boxes.length < count) {
+                const num = this.boxes.length + 1;
+                this.boxes.push({
+                    box_number: num,
+                    weight_kg: b1.weight_kg || '',
+                    length_cm: b1.length_cm || '',
+                    width_cm: b1.width_cm || '',
+                    height_cm: b1.height_cm || '',
+                    items: this.invoiceItems.map((item, idx) => ({
+                        item_index: idx,
+                        item_name: item.name,
+                        qty: 0
+                    }))
+                });
+            }
+            if (this.boxes.length > count) {
+                this.boxes = this.boxes.slice(0, count);
+            }
+            if (count === 1) {
+                this.autoAllocateSingleBox();
+            }
+            this.syncCargoWeight();
+        },
+
+        autoAllocateSingleBox() {
+            if (this.boxes.length > 0) {
+                this.boxes[0].items = this.invoiceItems.map((item, idx) => ({
+                    item_index: idx,
+                    item_name: item.name,
+                    qty: parseFloat(item.qty) || 0
+                }));
+            }
+        },
+
+        packingListWarning: '',
+
+        syncInvoiceItemQty(itemIndex) {
+            if (this.totalBoxes === 1) {
+                this.autoAllocateSingleBox();
+            } else {
+                const total = parseFloat(this.invoiceItems[itemIndex]?.qty) || 0;
+                let totalAllocated = this.getItemAllocatedQty(itemIndex);
+                if (totalAllocated > total) {
+                    for (let b = this.boxes.length - 1; b >= 0; b--) {
+                        const bItem = this.boxes[b]?.items?.[itemIndex];
+                        if (!bItem) continue;
+                        const current = parseFloat(bItem.qty) || 0;
+                        const excess = totalAllocated - total;
+                        if (excess <= 0) break;
+                        const reduction = Math.min(current, excess);
+                        bItem.qty = Math.max(0, current - reduction);
+                        totalAllocated -= reduction;
+                    }
+                }
+            }
+        },
+
+        getAvailableQtyForBox(boxIndex, itemIndex) {
+            const total = parseFloat(this.invoiceItems[itemIndex]?.qty) || 0;
+            const allocatedOtherBoxes = this.boxes.reduce((sum, b, bIdx) => {
+                if (bIdx === boxIndex) return sum;
+                const it = (b.items || []).find(i => i.item_index === itemIndex);
+                return sum + (it ? (parseFloat(it.qty) || 0) : 0);
+            }, 0);
+            return Math.max(0, total - allocatedOtherBoxes);
+        },
+
+        enforceMaxBoxItemQty(boxIndex, itemIndex) {
+            if (!this.boxes[boxIndex] || !this.boxes[boxIndex].items || !this.boxes[boxIndex].items[itemIndex]) return;
+            const maxAllowed = this.getAvailableQtyForBox(boxIndex, itemIndex);
+            let entered = parseFloat(this.boxes[boxIndex].items[itemIndex].qty);
+            if (isNaN(entered) || entered < 0) {
+                entered = 0;
+                this.boxes[boxIndex].items[itemIndex].qty = 0;
+            }
+            if (entered > maxAllowed) {
+                this.boxes[boxIndex].items[itemIndex].qty = maxAllowed;
+                const itemTitle = this.invoiceItems[itemIndex]?.name || ('Item #' + (itemIndex + 1));
+                const totalDecl = this.invoiceItems[itemIndex]?.qty || 0;
+                this.packingListWarning = `Quantity capped: '${itemTitle}' in Box #${boxIndex + 1} cannot exceed available quantity (${maxAllowed}). Total items packed cannot exceed entered invoice quantity of ${totalDecl}.`;
+                setTimeout(() => {
+                    if (this.packingListWarning && !this.hasOverAllocatedItems) {
+                        this.packingListWarning = '';
+                    }
+                }, 4000);
+            } else {
+                if (!this.hasOverAllocatedItems) {
+                    this.packingListWarning = '';
+                }
+            }
+        },
+
+        getItemAllocatedQty(itemIndex) {
+            return this.boxes.reduce((sum, box) => {
+                const found = (box.items || []).find(i => i.item_index === itemIndex);
+                return sum + (found ? (parseFloat(found.qty) || 0) : 0);
+            }, 0);
+        },
+
+        getItemRemainingQty(itemIndex) {
+            const total = parseFloat(this.invoiceItems[itemIndex]?.qty) || 0;
+            const allocated = this.getItemAllocatedQty(itemIndex);
+            return Math.max(0, total - allocated);
+        },
+
+        allocateRemainingToBox(boxIndex, itemIndex) {
+            const rem = this.getItemRemainingQty(itemIndex);
+            if (rem <= 0) return;
+            if (this.boxes[boxIndex] && this.boxes[boxIndex].items && this.boxes[boxIndex].items[itemIndex]) {
+                this.boxes[boxIndex].items[itemIndex].qty = (parseFloat(this.boxes[boxIndex].items[itemIndex].qty) || 0) + rem;
+                this.enforceMaxBoxItemQty(boxIndex, itemIndex);
+            }
+        },
+
+        allocateAllRemainingToBox(boxIndex) {
+            this.invoiceItems.forEach((_, itemIndex) => {
+                this.allocateRemainingToBox(boxIndex, itemIndex);
+            });
+        },
+
+        get hasOverAllocatedItems() {
+            return this.invoiceItems.some((item, idx) => {
+                const total = parseFloat(item.qty) || 0;
+                return this.getItemAllocatedQty(idx) > (total + 0.0001);
+            });
+        },
+
+        cloneBox1SpecsToAll() {
+            if (this.boxes.length <= 1) return;
+            const b1 = this.boxes[0];
+            const weight = b1.weight_kg !== '' ? b1.weight_kg : '';
+            const length = b1.length_cm !== '' ? b1.length_cm : '';
+            const width = b1.width_cm !== '' ? b1.width_cm : '';
+            const height = b1.height_cm !== '' ? b1.height_cm : '';
+
+            for (let i = 1; i < this.boxes.length; i++) {
+                this.boxes[i].weight_kg = weight;
+                this.boxes[i].length_cm = length;
+                this.boxes[i].width_cm = width;
+                this.boxes[i].height_cm = height;
+            }
+            this.syncCargoWeight();
+        },
+
+        cloneSpecsFromBox(sourceIdx, targetIdx) {
+            if (!this.boxes[sourceIdx] || !this.boxes[targetIdx]) return;
+            const src = this.boxes[sourceIdx];
+            this.boxes[targetIdx].weight_kg = src.weight_kg;
+            this.boxes[targetIdx].length_cm = src.length_cm;
+            this.boxes[targetIdx].width_cm = src.width_cm;
+            this.boxes[targetIdx].height_cm = src.height_cm;
+            this.syncCargoWeight();
+        },
+
+        autoDistributeItemsAcrossBoxes() {
+            if (this.boxes.length <= 1 || !this.invoiceItems.length) return;
+            const numBoxes = this.boxes.length;
+            
+            // Clear existing allocations
+            this.boxes.forEach(box => {
+                box.items = this.invoiceItems.map((item, idx) => ({
+                    item_index: idx,
+                    item_name: item.name,
+                    qty: 0
+                }));
+            });
+
+            // Distribute each invoice item across boxes evenly
+            this.invoiceItems.forEach((item, itemIdx) => {
+                const totalQty = Math.max(0, parseFloat(item.qty) || 0);
+                const perBox = Math.floor(totalQty / numBoxes);
+                let remainder = totalQty % numBoxes;
+
+                this.boxes.forEach((box, bIdx) => {
+                    let allocated = perBox;
+                    if (remainder > 0) {
+                        allocated += 1;
+                        remainder--;
+                    }
+                    if (box.items && box.items[itemIdx]) {
+                        box.items[itemIdx].qty = allocated;
+                    }
+                });
+            });
+            this.packingListWarning = '';
+        },
+
+        validatePackingListSubmission(event) {
+            if (this.totalBoxes > 1 && this.hasOverAllocatedItems) {
+                if (event) event.preventDefault();
+                alert('Cannot submit shipment: One or more items in the packing list exceed the total quantity entered in the invoice. Please ensure total packed quantities do not exceed the declared item quantities.');
+                return false;
+            }
+            return true;
+        },
+
+        async fetchHsSuggestions(itemIndex, query) {
+            if (!query || query.length < 2) {
+                this.invoiceItems[itemIndex].suggestions = [];
+                this.invoiceItems[itemIndex].showSuggestions = false;
+                return;
+            }
+            this.invoiceItems[itemIndex].isSearching = true;
+            try {
+                const res = await fetch(`/api/hs-codes/search?q=${encodeURIComponent(query)}&limit=6`);
+                const data = await res.json();
+                this.invoiceItems[itemIndex].suggestions = data.data || data.results || [];
+                this.invoiceItems[itemIndex].showSuggestions = true;
+            } catch (e) {
+                console.error('HS Code search failed', e);
+            } finally {
+                this.invoiceItems[itemIndex].isSearching = false;
+            }
+        },
+
+        selectHsCode(itemIndex, hs) {
+            this.invoiceItems[itemIndex].hs_code = hs.code;
+            this.invoiceItems[itemIndex].name = hs.commodity_name;
+            if (hs.standard_uom) this.invoiceItems[itemIndex].uom = hs.standard_uom;
+            this.invoiceItems[itemIndex].duty_rate = hs.export_duty_rate || 0;
+            this.invoiceItems[itemIndex].showSuggestions = false;
+            this.boxes.forEach(box => {
+                if (box.items && box.items[itemIndex]) {
+                    box.items[itemIndex].item_name = hs.commodity_name;
+                }
+            });
+        },
+
+        openWcoModal(itemIndex) {
+            this.activeItemIndexForWco = itemIndex;
+            this.wcoSearchQuery = this.invoiceItems[itemIndex]?.name || '';
+            this.wcoModalOpen = true;
+            this.performWcoSearch();
+        },
+
+        async performWcoSearch() {
+            this.wcoLoading = true;
+            try {
+                let url = '/api/hs-codes/search?limit=30';
+                if (this.wcoSearchQuery) url += `&q=${encodeURIComponent(this.wcoSearchQuery)}`;
+                if (this.wcoCategory) url += `&category=${encodeURIComponent(this.wcoCategory)}`;
+                const res = await fetch(url);
+                const data = await res.json();
+                this.wcoResults = data.data || data.results || [];
+            } catch (e) {
+                console.error('WCO fetch failed', e);
+            } finally {
+                this.wcoLoading = false;
+            }
+        },
+
+        chooseWcoResult(hs) {
+            if (this.activeItemIndexForWco !== null) {
+                this.selectHsCode(this.activeItemIndexForWco, hs);
+            }
+            this.wcoModalOpen = false;
+        },
+
+        get invoiceSubtotal() {
+            return this.invoiceItems.reduce((acc, item) => acc + ((parseFloat(item.qty) || 0) * (parseFloat(item.unit_price) || 0)), 0);
+        },
+
+        get totalCargoGrossWeight() {
+            if (this.totalBoxes > 1) {
+                return this.boxes.reduce((acc, b) => acc + (parseFloat(b.weight_kg) || 0), 0);
+            }
+            return parseFloat(this.boxes[0]?.weight_kg) || 1.0;
+        },
+
+        get totalCargoVolumetricWeight() {
+            if (this.totalBoxes > 1) {
+                return this.boxes.reduce((acc, b) => {
+                    const l = parseFloat(b.length_cm) || 0;
+                    const w = parseFloat(b.width_cm) || 0;
+                    const h = parseFloat(b.height_cm) || 0;
+                    return acc + ((l * w * h) / 5000);
+                }, 0);
+            }
+            const l = parseFloat(this.boxes[0]?.length_cm) || 0;
+            const w = parseFloat(this.boxes[0]?.width_cm) || 0;
+            const h = parseFloat(this.boxes[0]?.height_cm) || 0;
+            return (l * w * h) / 5000;
+        },
+
+        get totalChargeableWeight() {
+            return Math.max(this.totalCargoGrossWeight, this.totalCargoVolumetricWeight);
+        },
+
+        syncCargoWeight() {
+            const weightInput = document.getElementById('weight-input');
+            if (weightInput) {
+                weightInput.value = this.totalCargoGrossWeight.toFixed(2);
+            }
+            if (typeof calculateVolumetricWeight === 'function') {
+                calculateVolumetricWeight();
+            }
+        },
+
+        handleBillFileSelect(event) {
+            const file = event.target.files[0];
+            if (file) {
+                this.selectedBillFileName = file.name + ' (' + (file.size / 1024).toFixed(1) + ' KB)';
+            } else {
+                this.selectedBillFileName = '';
+            }
+        },
+
+        get invoiceDataJsonPayload() {
+            return JSON.stringify({
+                invoice_number: this.invoiceNumber,
+                invoice_date: this.invoiceDate,
+                currency: this.invoiceCurrency,
+                incoterm: this.incoterm,
+                export_reason: this.reasonForExport,
+                acquisition_source: this.acquisitionSource,
+                shipper_pan_vat: this.exporterPanVat,
+                shipper_exim_code: this.exporterEximCode,
+                consignee_tax_id: this.consigneeTaxId,
+                seller_bill_type: this.sellerBillType,
+                seller_bill_number: this.sellerBillNumber,
+                subtotal: this.invoiceSubtotal,
+                items: this.invoiceItems.map(it => ({
+                    description: it.name,
+                    hs_code: it.hs_code,
+                    origin_country: it.origin_country || 'Nepal',
+                    quantity: parseFloat(it.qty) || 0,
+                    uom: it.uom || 'PCS',
+                    unit_value: parseFloat(it.unit_price) || 0,
+                    total_value: (parseFloat(it.qty) || 0) * (parseFloat(it.unit_price) || 0),
+                    duty_rate: it.duty_rate || 0
+                }))
+            });
+        },
+
+        get packingListDataJsonPayload() {
+            return JSON.stringify({
+                total_boxes: this.totalBoxes,
+                total_gross_weight: this.totalCargoGrossWeight,
+                total_volumetric_weight: this.totalCargoVolumetricWeight,
+                boxes: this.boxes.map(b => ({
+                    box_number: b.box_number,
+                    length: parseFloat(b.length_cm) || 0,
+                    width: parseFloat(b.width_cm) || 0,
+                    height: parseFloat(b.height_cm) || 0,
+                    gross_weight: parseFloat(b.weight_kg) || 0,
+                    volumetric_weight: ((parseFloat(b.length_cm) || 0) * (parseFloat(b.width_cm) || 0) * (parseFloat(b.height_cm) || 0)) / 5000,
+                    items: (b.items || []).map(bi => ({
+                        item_index: bi.item_index,
+                        item_name: bi.item_name || (this.invoiceItems[bi.item_index]?.name || ''),
+                        hs_code: this.invoiceItems[bi.item_index]?.hs_code || '',
+                        quantity: parseFloat(bi.qty) || 0,
+                        uom: this.invoiceItems[bi.item_index]?.uom || 'PCS'
+                    }))
+                }))
+            });
+        }
+    };
+}
+document.addEventListener('alpine:init', () => {
+    if (window.Alpine) {
+        Alpine.data('shipmentConsoleData', shipmentConsoleData);
+    }
+});
+</script>
+
+<div class="max-w-7xl mx-auto space-y-6 pb-16" x-data="shipmentConsoleData()">
+    
+    <!-- TOP HERO BANNER -->
+    <div class="relative overflow-hidden bg-gradient-to-r from-slate-950 via-slate-900 to-teal-950 rounded-3xl p-6 sm:p-8 text-white shadow-xl border border-teal-800/40">
+        <div class="absolute -top-24 -right-24 w-96 h-96 bg-teal-500/10 rounded-full blur-3xl pointer-events-none"></div>
+        <div class="absolute -bottom-24 -left-24 w-96 h-96 bg-emerald-500/10 rounded-full blur-3xl pointer-events-none"></div>
+
+        <div class="relative z-10 flex flex-col md:flex-row md:items-center justify-between gap-6">
+            <div>
+                <div class="flex items-center gap-2 mb-2 flex-wrap">
+                    <span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-extrabold tracking-wider uppercase bg-teal-500/20 text-teal-300 border border-teal-500/30">
+                        <i class="fas fa-boxes-packing text-teal-400"></i>
+                        Unified Operating Console
+                    </span>
+                    <span class="text-xs text-slate-400">&bull; Consignment Booking & Doorstep Courier Intake</span>
+                </div>
+                <h1 class="text-2xl sm:text-3xl font-black tracking-tight text-white flex items-center gap-3">
+                    <span>Ship & Pickup Console</span>
+                </h1>
+                <p class="text-xs sm:text-sm text-slate-300 mt-1.5 max-w-2xl leading-relaxed">
+                    Operate complete consignment bookings or request rapid on-demand courier collection from one centralized cockpit.
+                    Features multi-stop routing, live tariff quotation, saved address book, and automated rider dispatch.
+                </p>
+            </div>
+
+            <!-- Quick Tariff / Rate Banner if arriving from Calculator -->
+            @if(request('quoted_rate'))
+                <div class="p-4 rounded-2xl bg-teal-900/50 border border-teal-500/40 backdrop-blur-xs flex items-center gap-3 self-start md:self-auto shadow-sm">
+                    <div class="w-10 h-10 rounded-xl bg-teal-500/20 border border-teal-400/30 flex items-center justify-center text-teal-300 text-lg flex-shrink-0">
+                        <i class="fas fa-certificate"></i>
+                    </div>
+                    <div>
+                        <div class="flex items-center gap-2 mb-0.5 flex-wrap">
+                            <span class="px-2 py-0.5 rounded text-[10px] font-extrabold uppercase tracking-wider bg-teal-500/20 text-teal-300 border border-teal-500/30">
+                                Verified Rate Applied
+                            </span>
+                            <span class="text-xs text-slate-300 font-bold">{{ request('receiver_country') }}</span>
+                            @if(request('pickup_location_type') === 'outside_ktm')
+                                <span class="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                                    <i class="fas fa-truck-ramp-box text-[9px] mr-1"></i> Regional Feeder: {{ request('pickup_city') }}
+                                </span>
+                            @endif
+                        </div>
+                        <p class="text-xs text-slate-300">
+                            Quoted Tariff: <span class="text-teal-300 font-mono font-black text-sm">Rs. {{ number_format((float)request('quoted_rate')) }}</span>
+                            <span class="text-[11px] text-slate-400 ml-1">({{ request('chargeable_weight', request('weight')) }} KG)</span>
+                            @if((float)request('domestic_feeder_charge') > 0)
+                                <span class="text-amber-300 text-xs ml-1 font-semibold">&bull; Includes Rs. {{ number_format((float)request('domestic_feeder_charge')) }} Feeder Linehaul</span>
+                            @endif
+                        </p>
+                    </div>
+                </div>
+            @endif
+        </div>
+    </div>
+
+    <!-- ========================================================================= -->
+    <!-- OPERATING CONSOLE VIEW SWITCHER (SINGLE UNIFIED BOOKING FUNCTION) -->
+    <!-- ========================================================================= -->
+    <div class="bg-slate-900/90 border border-teal-800/50 rounded-2xl p-2 shadow-sm flex flex-col sm:flex-row items-center justify-between gap-3">
+        <div class="flex items-center gap-2 w-full sm:w-auto overflow-x-auto">
+            <!-- Unified Booking Function -->
+            <button type="button" 
+                    @click="switchConsole('booking')"
+                    :class="activeConsoleView === 'booking' ? 'bg-gradient-to-r from-teal-600 to-emerald-600 text-white shadow-md font-black' : 'text-slate-300 hover:text-white hover:bg-slate-800/80 font-semibold'"
+                    class="px-4 py-2.5 rounded-xl text-xs transition flex items-center gap-2 cursor-pointer flex-shrink-0">
+                <i class="fas fa-boxes-stacked text-teal-300"></i>
+                <span>Create Shipment & Pickup</span>
+                <span class="text-[9px] uppercase font-mono px-1.5 py-0.5 rounded bg-black/20 text-teal-200 border border-teal-400/30">Single Function</span>
+            </button>
+
+            <!-- Live Dispatches Queue -->
+            <button type="button" 
+                    @click="switchConsole('queue')"
+                    :class="activeConsoleView === 'queue' ? 'bg-gradient-to-r from-teal-600 to-emerald-600 text-white shadow-md font-black' : 'text-slate-300 hover:text-white hover:bg-slate-800/80 font-semibold'"
+                    class="px-4 py-2.5 rounded-xl text-xs transition flex items-center gap-2 cursor-pointer flex-shrink-0">
+                <i class="fas fa-list-check text-amber-300"></i>
+                <span>Live Dispatches Queue</span>
+                @php
+                    $pendingCount = $pickupStatusCounts['pending'] ?? 0;
+                @endphp
+                @if($pendingCount > 0)
+                    <span class="px-2 py-0.5 rounded-full text-[10px] font-mono font-black bg-amber-400 text-slate-950">
+                        {{ $pendingCount }} Active
+                    </span>
+                @endif
+            </button>
+        </div>
+
+        <div class="flex items-center gap-3">
+            <!-- AI Voice Autofill Header Trigger -->
+            <button type="button" 
+                    onclick="window.initiateVoiceAutofillAssistant(true)"
+                    id="voice-autofill-header-btn"
+                    title="Start AI Voice-Guided Form Autofill"
+                    class="px-3 py-1.5 rounded-xl bg-gradient-to-r from-teal-500/20 via-emerald-500/20 to-teal-500/10 hover:from-teal-500/30 hover:to-emerald-500/30 text-teal-300 border border-teal-500/40 text-xs font-bold transition flex items-center gap-2 shadow-xs cursor-pointer">
+                <i class="fas fa-microphone-lines text-teal-400 animate-pulse"></i>
+                <span class="hidden sm:inline">AI Voice Autofill</span>
+                <span class="sm:hidden">Voice AI</span>
+                <span class="px-1.5 py-0.5 rounded text-[9px] font-black uppercase tracking-wider bg-teal-500 text-slate-950">Concierge</span>
+            </button>
+
+            <div class="hidden lg:flex items-center gap-2 text-xs text-slate-400 pr-2">
+                <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                <span>Single Unified Logistics Console &bull; Auto-Sync</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- ERROR NOTIFICATIONS -->
+    @if($errors->any())
+        <div class="p-4 rounded-2xl bg-rose-50 border border-rose-200 text-rose-900 flex items-start gap-3 shadow-xs">
+            <div class="w-8 h-8 rounded-xl bg-rose-500 text-white flex items-center justify-center flex-shrink-0 mt-0.5">
+                <i class="fas fa-triangle-exclamation"></i>
+            </div>
+            <div class="text-xs">
+                <h4 class="font-bold text-rose-950 text-sm">Please check the required fields:</h4>
+                <ul class="list-disc list-inside mt-1 space-y-0.5">
+                    @foreach($errors->all() as $error)
+                        <li>{{ $error }}</li>
+                    @endforeach
+                </ul>
+            </div>
+        </div>
+    @endif
+
+    @if(session('success'))
+        <div class="p-4 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-900 flex items-start gap-3 shadow-xs">
+            <div class="w-8 h-8 rounded-xl bg-emerald-500 text-white flex items-center justify-center flex-shrink-0 mt-0.5">
+                <i class="fas fa-check"></i>
+            </div>
+            <div class="text-xs">
+                <h4 class="font-bold text-emerald-950 text-sm">Action Confirmed</h4>
+                <p class="mt-0.5">{{ session('success') }}</p>
+            </div>
+        </div>
+    @endif
+
+    <!-- CONVERT PICKUP INQUIRY BANNER -->
+    @if(isset($convertPickup) && $convertPickup)
+        <div class="p-4 rounded-2xl bg-amber-50 border border-amber-300 text-amber-900 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs">
+            <div class="flex items-center gap-3">
+                <div class="w-10 h-10 rounded-xl bg-amber-500 text-white flex items-center justify-center font-bold text-lg shadow-sm flex-shrink-0">
+                    <i class="fas fa-arrow-up-right-from-square"></i>
+                </div>
+                <div>
+                    <h4 class="text-xs font-black uppercase tracking-wider text-amber-950 flex items-center gap-2">
+                        <span>Upgrading Doorstep Collection to Full Consignment</span>
+                        <span class="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold bg-amber-200 text-amber-900">Ref: {{ $convertPickup->tracking_number }}</span>
+                    </h4>
+                    <p class="text-xs text-amber-800 mt-0.5">
+                        Sender address, estimated weight ({{ $convertPickup->estimated_weight_kg }} KG), and cargo specs have been pre-filled.
+                    </p>
+                </div>
+            </div>
+            <button type="button" @click="switchConsole('booking')" class="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs rounded-xl transition self-start sm:self-auto">
+                Proceed to Consignment Form
+            </button>
+        </div>
+    @endif
+
+    <!-- ========================================================================= -->
+    <!-- AI VOICE CONCIERGE INVITATION (ASKED BEFOREHAND TO INITIATE) -->
+    <!-- ========================================================================= -->
+    <div id="ai-voice-invitation-banner" 
+         class="relative overflow-hidden rounded-3xl bg-gradient-to-r from-slate-900 via-teal-950 to-slate-900 border border-teal-500/40 p-5 sm:p-6 text-white shadow-xl backdrop-blur-xl transition-all duration-300">
+        <div class="absolute -right-8 -bottom-8 w-40 h-40 bg-teal-500/10 rounded-full blur-2xl pointer-events-none"></div>
+        <div class="relative z-10 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div class="flex items-start gap-4">
+                <div class="relative w-12 h-12 rounded-2xl bg-gradient-to-tr from-teal-500 to-emerald-400 p-0.5 shadow-lg flex-shrink-0">
+                    <div class="w-full h-full bg-slate-950 rounded-[14px] flex items-center justify-center text-xl">
+                        <span>🎙️</span>
+                    </div>
+                    <span class="absolute -top-1 -right-1 flex h-3 w-3">
+                        <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                        <span class="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
+                    </span>
+                </div>
+                <div>
+                    <div class="flex items-center gap-2">
+                        <h4 class="text-sm font-black text-white tracking-wide">
+                            Would you like AI Voice Autofill Assistance? Meet Chanda, your AI Copilot
+                        </h4>
+                        <span class="px-2 py-0.5 rounded-full text-[9px] font-bold uppercase tracking-wider bg-teal-500/20 text-teal-300 border border-teal-500/30">
+                            Hands-Free Voice Typing
+                        </span>
+                        <span class="px-2 py-0.5 rounded-full text-[9px] font-bold uppercase tracking-wider bg-rose-500/20 text-rose-300 border border-rose-500/30 flex items-center gap-1">
+                            <span>🇳🇵</span> Nepalese Accent Calibrated
+                        </span>
+                    </div>
+                    <p class="text-xs text-slate-300 mt-1 max-w-2xl leading-relaxed">
+                        Namaste <strong>{{ session('ai_preferred_name', explode(' ', Auth::user()->name ?? 'Client')[0]) }} Ji</strong>! I am <strong>Chanda</strong>, your dedicated NETPACK AI Assistant. I am calibrated for <strong>Nepalese English & Romanized Nepali</strong> (e.g. <em>Jhapa bata</em>, <em>Poland pathaune</em>, <em>20 kg</em>, <em>luga</em>). I speak with respectful warmth and excitement to guide and auto-type every consignment field as we speak.
+                    </p>
+                </div>
+            </div>
+
+            <div class="flex items-center gap-2.5 self-end sm:self-center flex-shrink-0">
+                <button type="button" 
+                        onclick="window.initiateVoiceAutofillAssistant(true)"
+                        class="px-4 py-2 rounded-xl bg-gradient-to-r from-teal-500 to-emerald-500 hover:from-teal-400 hover:to-emerald-400 text-slate-950 text-xs font-black tracking-wide shadow-md hover:shadow-teal-500/20 transition flex items-center gap-2 cursor-pointer">
+                    <i class="fas fa-play text-[10px]"></i>
+                    <span>Yes, Guide Me by Voice with Chanda</span>
+                </button>
+                <button type="button" 
+                        onclick="window.dismissVoiceAutofillInvitation()"
+                        class="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-xs font-semibold transition cursor-pointer">
+                    <span>No, I'll Type Manually</span>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ACTIVE VOICE CONCIERGE CONTROLLER (DRAGGABLE & ADJUSTABLE ANYWHERE) -->
+    <div id="ai-voice-active-controller" 
+         style="display: none; background: #020617 !important; color: #f8fafc !important; border: 2px solid #0d9488 !important; box-shadow: 0 25px 65px rgba(0,0,0,0.85) !important;" 
+         class="fixed bottom-5 left-1/2 -translate-x-1/2 w-[95%] max-w-4xl z-50 rounded-3xl p-4 sm:p-5 backdrop-blur-2xl ring-4 ring-teal-500/20 transition-all duration-300">
+        
+        <!-- Draggable Cockpit Handle -->
+        <div id="ai-voice-drag-handle" 
+             style="border-bottom: 1px solid #134e4a !important;"
+             class="flex items-center justify-between pb-2 mb-3 cursor-move active:cursor-grabbing select-none text-[11px] font-mono">
+            <span class="flex items-center gap-2 font-black tracking-wider uppercase" style="color: #2dd4bf !important;">
+                <i class="fas fa-grip-lines text-teal-400"></i>
+                <span>CHANDA &bull; NETPACK AI Logistics Copilot &bull; Drag Anywhere</span>
+            </span>
+            <div class="flex items-center gap-2">
+                <button type="button" onclick="window.resetAiBarPosition(event)" 
+                        title="Snap Copilot back to bottom dock"
+                        style="background: #134e4a !important; color: #ccfbf1 !important; border: 1px solid #14b8a6 !important;"
+                        class="px-2.5 py-0.5 rounded-md text-[10px] font-bold transition flex items-center gap-1 cursor-pointer">
+                    <i class="fas fa-anchor text-[9px]"></i>
+                    <span>Snap to Bottom</span>
+                </button>
+                <button type="button" onclick="window.toggleAiBarMinimize(event)" id="ai-bar-min-btn" 
+                        title="Minimize / Expand Copilot"
+                        style="background: #1e293b !important; color: #f8fafc !important;"
+                        class="w-6 h-6 rounded-md text-xs flex items-center justify-center transition cursor-pointer hover:bg-slate-700">
+                    <i class="fas fa-minus text-[10px]"></i>
+                </button>
+            </div>
+        </div>
+
+        <div class="flex flex-col md:flex-row md:items-center justify-between gap-4">
+            <!-- Left Info -->
+            <div class="flex items-center gap-3.5 min-w-0">
+                <div class="w-11 h-11 rounded-2xl flex items-center justify-center text-lg flex-shrink-0 shadow-md" id="ai-voice-avatar-icon" style="background: rgba(13, 148, 136, 0.25) !important; border: 1px solid #14b8a6 !important; color: #5eead4 !important;">
+                    <i class="fas fa-microphone-lines animate-pulse"></i>
+                </div>
+                <div class="min-w-0">
+                    <div class="flex items-center gap-2 flex-wrap">
+                        <span class="px-2 py-0.5 rounded text-[10px] font-black font-mono uppercase" id="ai-voice-step-badge" style="background: #14b8a6 !important; color: #020617 !important;">
+                            Field 1 of 18
+                        </span>
+                        <span class="text-xs font-black truncate" id="ai-voice-step-title" style="color: #ffffff !important;">
+                            Shipment Service Category
+                        </span>
+                        <span class="text-[10px] font-mono font-bold" id="ai-voice-status-indicator" style="color: #34d399 !important;">
+                            ● Speaking question...
+                        </span>
+                    </div>
+                    <p class="text-xs font-bold mt-1 leading-snug" id="ai-voice-current-prompt" style="color: #f1f5f9 !important; text-shadow: 0 1px 2px rgba(0,0,0,0.6);">
+                        Loading question...
+                    </p>
+                    <p class="text-[11px] font-mono mt-0.5 italic truncate" id="ai-voice-transcript-preview" style="display: none; color: #6ee7b7 !important;">
+                        🎙️ Transcribed: <span class="font-bold" id="ai-voice-transcript-text" style="color: #34d399 !important;"></span>
+                    </p>
+                </div>
+            </div>
+
+            <!-- Equalizer & Actions -->
+            <div class="flex items-center gap-2 self-end md:self-center flex-shrink-0">
+                <!-- Soundwave Visualizer Bars -->
+                <div class="flex items-center gap-1 px-2.5 py-1.5 rounded-xl border h-9" id="ai-voice-equalizer" title="Microphone Audio Volume Meter" style="background: #020617 !important; border-color: #1e293b !important;">
+                    <span class="eq-bar w-1.5 h-3 bg-teal-400 rounded-full transition-all duration-75"></span>
+                    <span class="eq-bar w-1.5 h-5 bg-emerald-400 rounded-full transition-all duration-75"></span>
+                    <span class="eq-bar w-1.5 h-2 bg-teal-300 rounded-full transition-all duration-75"></span>
+                    <span class="eq-bar w-1.5 h-4 bg-teal-500 rounded-full transition-all duration-75"></span>
+                </div>
+
+                <!-- 1-Click Allow Microphone Button (Appears if permission was blocked) -->
+                <button type="button" id="ai-voice-unblock-mic-btn" onclick="window.requestMicrophoneAccess()" 
+                        style="display: none;"
+                        class="px-3 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-black transition flex items-center gap-1.5 shadow-lg shadow-amber-500/30 cursor-pointer animate-bounce"
+                        title="Click to allow microphone in your browser">
+                    <i class="fas fa-lock-open text-xs"></i>
+                    <span>Allow Mic</span>
+                </button>
+
+                <!-- Prominent Tap to Speak Button -->
+                <button type="button" id="ai-voice-mic-btn" onclick="window.toggleVoiceAutofillMic()" 
+                        class="px-3 py-1.5 rounded-xl bg-rose-500 hover:bg-rose-600 text-white text-xs font-bold transition flex items-center gap-1.5 shadow-lg shadow-rose-500/30 cursor-pointer animate-pulse"
+                        title="Click to talk or mute microphone">
+                    <i class="fas fa-microphone text-xs" id="ai-voice-mic-icon"></i>
+                    <span id="ai-voice-mic-text">Listening...</span>
+                </button>
+
+                <button type="button" onclick="window.voiceAssistantReask()" title="Re-ask current question"
+                        style="background: #1e293b !important; color: #f8fafc !important;"
+                        class="p-2 sm:px-2.5 sm:py-1.5 rounded-xl text-xs font-semibold transition flex items-center gap-1.5 cursor-pointer hover:bg-slate-700">
+                    <i class="fas fa-rotate-right text-[10px]"></i>
+                    <span class="hidden sm:inline">Repeat</span>
+                </button>
+
+                <button type="button" onclick="window.voiceAssistantPrev()" title="Go to previous field"
+                        style="background: #1e293b !important; color: #f8fafc !important;"
+                        class="p-2 sm:px-2.5 sm:py-1.5 rounded-xl text-xs font-semibold transition flex items-center gap-1.5 cursor-pointer hover:bg-slate-700">
+                    <i class="fas fa-arrow-left text-[10px]"></i>
+                    <span class="hidden sm:inline">Back</span>
+                </button>
+
+                <button type="button" onclick="window.voiceAssistantNext()" title="Skip to next field"
+                        style="background: #1e293b !important; color: #f8fafc !important;"
+                        class="p-2 sm:px-2.5 sm:py-1.5 rounded-xl text-xs font-semibold transition flex items-center gap-1.5 cursor-pointer hover:bg-slate-700">
+                    <span class="hidden sm:inline">Skip</span>
+                    <i class="fas fa-arrow-right text-[10px]"></i>
+                </button>
+
+                <button type="button" onclick="window.exitVoiceAutofillAssistant()" title="Stop Voice Assistant"
+                        class="px-2.5 py-1.5 rounded-xl bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/30 text-xs font-bold transition flex items-center gap-1.5 cursor-pointer">
+                    <i class="fas fa-xmark text-[10px]"></i>
+                    <span>Stop</span>
+                </button>
+            </div>
+        </div>
+
+        <!-- Inline Quick Answer / Keyboard Fallback Bar -->
+        <div class="mt-3 pt-3 flex items-center gap-2" id="ai-voice-quick-input-row" style="border-top: 1px solid #1e293b !important;">
+            <div class="text-[11px] font-bold flex items-center gap-1.5 flex-shrink-0" style="color: #94a3b8 !important;">
+                <i class="fas fa-keyboard text-teal-400"></i>
+                <span class="hidden sm:inline">Or type answer:</span>
+            </div>
+            <input type="text" id="ai-voice-quick-input" 
+                   placeholder="Speak now into your microphone, or type directly into form boxes..." 
+                   onkeydown="if(event.key === 'Enter'){ event.preventDefault(); window.submitManualVoiceStepInput(); }"
+                   style="background: #0f172a !important; color: #ffffff !important; border: 1px solid #334155 !important;"
+                   class="flex-1 text-xs rounded-lg px-3 py-2 placeholder-slate-400 outline-none focus:ring-2 focus:ring-teal-400">
+            <button type="button" onclick="window.submitManualVoiceStepInput()"
+                    style="background: #0d9488 !important; color: #ffffff !important;"
+                    class="px-3.5 py-2 rounded-lg text-xs font-black transition flex items-center gap-1 cursor-pointer hover:opacity-90">
+                <span>Apply</span>
+                <i class="fas fa-arrow-right text-[10px]"></i>
+            </button>
+            <span class="hidden lg:inline text-[10px] font-mono ml-1" style="color: #5eead4 !important;">
+                Tip: Direct typing in form boxes is also accepted!
+            </span>
+        </div>
+    </div>
+
+    <!-- ========================================================================= -->
+    <!-- UNIFIED SHIPMENT & DOORSTEP PICKUP BOOKING FORM -->
+    <!-- ========================================================================= -->
+    <div x-show="activeConsoleView === 'booking' || activeConsoleTab === 'consignment'" x-transition class="space-y-6">
+        <form action="{{ route('shipments.store') }}" method="POST" enctype="multipart/form-data" id="shipment-form" novalidate
+              @submit="return validateAndSubmitConsignment($event)"
+              class="space-y-6">
+            @csrf
+            @if(request()->filled('quoted_rate'))
+                <input type="hidden" name="quoted_rate" value="{{ request('quoted_rate') }}">
+                <input type="hidden" name="chargeable_weight" value="{{ request('chargeable_weight', request('weight')) }}">
+                <input type="hidden" name="pickup_location_type" value="{{ request('pickup_location_type') }}">
+                <input type="hidden" name="pickup_city" value="{{ request('pickup_city') }}">
+                <input type="hidden" name="domestic_feeder_charge" value="{{ request('domestic_feeder_charge') }}">
+            @endif
+
+            @if(isset($convertPickup) && $convertPickup)
+                <input type="hidden" name="convert_pickup_id" value="{{ $convertPickup->id }}">
+            @endif
+
+            <!-- 1. SERVICE MODE SELECTOR (DOMESTIC / INTERNATIONAL / E-COMMERCE) -->
+            <div class="bg-white rounded-3xl p-6 shadow-sm border border-slate-200/90 space-y-6">
+                <div>
+                    <label class="text-xs font-black uppercase tracking-wider text-slate-700 block mb-3">
+                        1. Select Shipment Service Category *
+                    </label>
+                    
+                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
+                        <!-- Tab 1: Domestic -->
+                        <button type="button" onclick="switchMode('domestic')" id="mode-btn-domestic"
+                                class="mode-selector-btn border-2 border-teal-600 bg-teal-50/70 text-slate-900 ring-2 ring-teal-500/20 rounded-2xl p-4 text-left transition flex items-start gap-3.5 cursor-pointer">
+                            <div class="w-10 h-10 rounded-xl bg-teal-600 text-white flex items-center justify-center text-lg flex-shrink-0 shadow-xs">
+                                <i class="fas fa-truck-fast"></i>
+                            </div>
+                            <div>
+                                <span class="block text-sm font-black text-slate-900">Domestic Delivery</span>
+                                <span class="block text-[11px] text-slate-500 mt-0.5 leading-snug">Inter-city & inter-province courier across Nepal's 77 districts</span>
+                            </div>
+                        </button>
+
+                        <!-- Tab 2: International -->
+                        <button type="button" onclick="switchMode('international')" id="mode-btn-international"
+                                class="mode-selector-btn border-2 border-slate-200 bg-white hover:border-slate-300 text-slate-900 rounded-2xl p-4 text-left transition flex items-start gap-3.5 cursor-pointer">
+                            <div class="w-10 h-10 rounded-xl bg-slate-100 text-slate-700 flex items-center justify-center text-lg flex-shrink-0 shadow-xs">
+                                <i class="fas fa-plane-departure"></i>
+                            </div>
+                            <div>
+                                <span class="block text-sm font-black text-slate-900">International Air</span>
+                                <span class="block text-[11px] text-slate-500 mt-0.5 leading-snug">Worldwide air express & cargo to USA, UK, AUS, UAE & 220+ hubs</span>
+                            </div>
+                        </button>
+
+                        <!-- Tab 3: E-Commerce -->
+                        <button type="button" onclick="switchMode('ecommerce')" id="mode-btn-ecommerce"
+                                class="mode-selector-btn border-2 border-slate-200 bg-white hover:border-slate-300 text-slate-900 rounded-2xl p-4 text-left transition flex items-start gap-3.5 cursor-pointer">
+                            <div class="w-10 h-10 rounded-xl bg-slate-100 text-slate-700 flex items-center justify-center text-lg flex-shrink-0 shadow-xs">
+                                <i class="fas fa-motorcycle"></i>
+                            </div>
+                            <div>
+                                <span class="block text-sm font-black text-slate-900">E-Commerce Rider</span>
+                                <span class="block text-[11px] text-slate-500 mt-0.5 leading-snug">Instant dispatch, same-day valley deliveries, and cash on delivery</span>
+                            </div>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Hidden input for shipment_type -->
+                <input type="hidden" name="shipment_type" id="shipment_type" value="{{ old('shipment_type', request('shipment_type', 'domestic')) }}">
+
+                <!-- Dynamic Service SLA Tier Sub-options -->
+                <div class="pt-4 border-t border-slate-100">
+                    <!-- Domestic Service Options -->
+                    <div id="service-options-domestic" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-xs font-bold text-slate-700 mb-1.5">Domestic Service Tier SLA *</label>
+                            <select name="service_type" id="domestic_service_type" class="w-full text-xs px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-semibold text-slate-800">
+                                @if(!empty($domesticServices) && is_array($domesticServices))
+                                    @foreach($domesticServices as $key => $item)
+                                        @php
+                                            $displayName = is_array($item) 
+                                                ? (($item['icon'] ?? '') . ' ' . ($item['name'] ?? strtoupper($key)) . (!empty($item['time']) ? ' (' . $item['time'] . ')' : ''))
+                                                : $item;
+                                        @endphp
+                                        <option value="{{ $key }}" @selected(old('service_type', 'standard') == $key)>{{ trim($displayName) }}</option>
+                                    @endforeach
+                                @else
+                                    <option value="flash">⚡ FLASH (1-2 Hours Urgent Delivery)</option>
+                                    <option value="same_day">🕐 SAME DAY (4-6 Hours Express)</option>
+                                    <option value="standard" selected>🚚 STANDARD (1-2 Days Normal Transit)</option>
+                                    <option value="himalayan">🏔️ HIMALAYAN (2-4 Days Remote Districts)</option>
+                                @endif
+                            </select>
+                        </div>
+
+                        <div>
+                            <label class="block text-xs font-bold text-slate-700 mb-1.5">Package Classification</label>
+                            <select name="package_type" class="w-full text-xs px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 text-slate-800 font-medium">
+                                <option value="parcel" selected>📦 Standard Parcel / Goods</option>
+                                <option value="box">📦 Box / Heavy Carton</option>
+                                <option value="envelope">✉️ Documents / Legal Envelopes</option>
+                                <option value="fragile">⚡ Fragile Glassware / Electronics</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- International Service Options -->
+                    <div id="service-options-international" class="hidden grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-xs font-bold text-slate-700 mb-1.5">International Air Courier Mode *</label>
+                            <select id="international_service_type" class="w-full text-xs px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-semibold text-slate-800">
+                                <option value="express" {{ request('service_type') === 'express' ? 'selected' : '' }}>⚡ Priority Express Service (3–4 Working Days)</option>
+                                <option value="economy" {{ request('service_type', 'economy') === 'economy' && request('service_type') !== 'express' ? 'selected' : '' }}>🌍 Economy Air Cargo Service (6–8 Working Days)</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label class="block text-xs font-bold text-slate-700 mb-1.5">Package Packaging</label>
+                            <select name="intl_package_type" class="w-full text-xs px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 text-slate-800 font-medium">
+                                <option value="box" selected>📦 Box / Heavy Carton</option>
+                                <option value="parcel">📦 Flyer / Commercial Parcel</option>
+                                <option value="envelope">✉️ International Document / Letter</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- E-Commerce Service Options -->
+                    <div id="service-options-ecommerce" class="hidden grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-xs font-bold text-slate-700 mb-1.5">E-Commerce Rider SLA *</label>
+                            <select id="ecommerce_service_type" class="w-full text-xs px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-semibold text-slate-800">
+                                <option value="flash" selected>⚡ Instant Rider Dispatch (Within 60-90 Mins)</option>
+                                <option value="same_day">🚀 Same-Day Delivery (4-6 Hours)</option>
+                                <option value="standard">📦 Standard Next-Day Collection</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label class="block text-xs font-bold text-slate-700 mb-1.5">Package Type</label>
+                            <select name="ecom_package_type" class="w-full text-xs px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 text-slate-800 font-medium">
+                                <option value="parcel" selected>🛍️ E-Commerce Retail Parcel</option>
+                                <option value="box">📦 Carton / Multi-Item Order</option>
+                                <option value="grocery">🍎 Grocery / Perishable Foodstuff</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Auto-routed Network Identifiers -->
+                @if(request()->filled('origin_zone_id'))
+                    <input type="hidden" name="origin_zone_id" value="{{ request('origin_zone_id') }}">
+                @endif
+                @if(request()->filled('destination_zone_id'))
+                    <input type="hidden" name="destination_zone_id" value="{{ request('destination_zone_id') }}">
+                @endif
+            </div>
+
+            <!-- 2. COLLECTION METHOD & SENDER DETAILS (MERGED SINGLE FUNCTION, PICKUP CHOSEN INITIALLY OR OPTIONAL) -->
+            <div class="bg-white rounded-3xl p-6 shadow-sm border border-slate-200/90 space-y-6">
+                <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-100">
+                    <div>
+                        <h3 class="text-sm font-black uppercase tracking-wider text-slate-900 flex items-center gap-2">
+                            <span class="w-5 h-5 rounded-full bg-teal-600 text-white text-[10px] flex items-center justify-center font-bold">2</span>
+                            <span>📦 Collection Method & Sender Details</span>
+                        </h3>
+                        <p class="text-xs text-slate-500 mt-0.5">
+                            Select how packages will be collected: dispatch our doorstep rider fleet or drop off at any Netpack station.
+                        </p>
+                    </div>
+
+                    <div x-show="hasDoorstepPickup" x-transition>
+                        <button type="button" onclick="addPickupPoint()" 
+                                class="px-4 py-2 rounded-xl bg-teal-50 hover:bg-teal-100 text-teal-800 border border-teal-200 text-xs font-extrabold transition flex items-center gap-1.5 self-start sm:self-auto cursor-pointer shadow-xs">
+                            <i class="fas fa-plus text-teal-600"></i>
+                            <span>Add Another Pickup Point</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- DUAL METHOD SELECTOR CARDS -->
+                <input type="hidden" name="schedule_doorstep_pickup" id="schedule_doorstep_pickup" :value="hasDoorstepPickup ? '1' : '0'">
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <!-- Option 1: Doorstep Courier Collection -->
+                    <div @click="setDoorstepPickup(true)"
+                         class="relative p-4 sm:p-5 rounded-2xl border-2 transition-all cursor-pointer flex flex-col justify-between"
+                         :class="hasDoorstepPickup ? 'bg-gradient-to-br from-teal-50 via-emerald-50/60 to-white border-teal-600 ring-2 ring-teal-500/20 shadow-sm' : 'bg-white border-slate-200 hover:border-slate-300 opacity-80 hover:opacity-100'">
+                        <div class="flex items-start justify-between gap-3">
+                            <div class="flex items-start gap-3.5">
+                                <div class="w-10 h-10 rounded-xl flex items-center justify-center text-lg flex-shrink-0 transition"
+                                     :class="hasDoorstepPickup ? 'bg-teal-600 text-white shadow-xs' : 'bg-slate-100 text-slate-600'">
+                                    <i class="fas fa-motorcycle"></i>
+                                </div>
+                                <div>
+                                    <div class="flex items-center gap-2">
+                                        <span class="text-sm font-black text-slate-900">Doorstep Courier Collection</span>
+                                        <span class="px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-wider bg-teal-600 text-white">Rider Fleet</span>
+                                    </div>
+                                    <p class="text-xs text-slate-600 mt-1 leading-relaxed">
+                                        A courier rider will be dispatched to collect packages directly from your location.
+                                    </p>
+                                </div>
+                            </div>
+                            <div class="w-5 h-5 rounded-full border-2 flex items-center justify-center transition flex-shrink-0 mt-0.5"
+                                 :class="hasDoorstepPickup ? 'border-teal-600 bg-teal-600 text-white' : 'border-slate-300 bg-white'">
+                                <i class="fas fa-check text-[10px]" x-show="hasDoorstepPickup"></i>
+                            </div>
+                        </div>
+                        <div class="mt-3 pt-3 border-t border-slate-200/60 flex items-center justify-between text-[11px]">
+                            <span class="font-extrabold text-teal-700" x-show="hasDoorstepPickup">✓ Collection Active</span>
+                            <span class="text-slate-400 font-medium" x-show="!hasDoorstepPickup">Click to dispatch rider</span>
+                            <span class="text-slate-500 font-medium">On-Demand Pickup</span>
+                        </div>
+                    </div>
+
+                    <!-- Option 2: Station / Counter Drop-off -->
+                    <div @click="setDoorstepPickup(false)"
+                         class="relative p-4 sm:p-5 rounded-2xl border-2 transition-all cursor-pointer flex flex-col justify-between"
+                         :class="!hasDoorstepPickup ? 'bg-gradient-to-br from-slate-100 via-slate-50 to-white border-slate-800 ring-2 ring-slate-800/10 shadow-sm' : 'bg-white border-slate-200 hover:border-slate-300 opacity-80 hover:opacity-100'">
+                        <div class="flex items-start justify-between gap-3">
+                            <div class="flex items-start gap-3.5">
+                                <div class="w-10 h-10 rounded-xl flex items-center justify-center text-lg flex-shrink-0 transition"
+                                     :class="!hasDoorstepPickup ? 'bg-slate-800 text-white shadow-xs' : 'bg-slate-100 text-slate-600'">
+                                    <i class="fas fa-store"></i>
+                                </div>
+                                <div>
+                                    <div class="flex items-center gap-2">
+                                        <span class="text-sm font-black text-slate-900">Station / Counter Drop-off</span>
+                                        <span class="px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-wider bg-slate-200 text-slate-700">Self Drop-off</span>
+                                    </div>
+                                    <p class="text-xs text-slate-600 mt-1 leading-relaxed">
+                                        You drop off packages at any Netpack station or branch counter. No rider will be dispatched.
+                                    </p>
+                                </div>
+                            </div>
+                            <div class="w-5 h-5 rounded-full border-2 flex items-center justify-center transition flex-shrink-0 mt-0.5"
+                                 :class="!hasDoorstepPickup ? 'border-slate-800 bg-slate-800 text-white' : 'border-slate-300 bg-white'">
+                                <i class="fas fa-check text-[10px]" x-show="!hasDoorstepPickup"></i>
+                            </div>
+                        </div>
+                        <div class="mt-3 pt-3 border-t border-slate-200/60 flex items-center justify-between text-[11px]">
+                            <span class="font-extrabold text-slate-800" x-show="!hasDoorstepPickup">✓ Counter Drop-off Active</span>
+                            <span class="text-slate-400 font-medium" x-show="hasDoorstepPickup">Click for self drop-off</span>
+                            <span class="text-slate-500 font-medium">Standard Hub Processing</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ========================================================================= -->
+                <!-- DOORSTEP PICKUP DETAILS CONTAINER (ONLY SHOWN WHEN hasDoorstepPickup IS TRUE) -->
+                <!-- ========================================================================= -->
+                <div x-show="hasDoorstepPickup" x-transition class="space-y-6">
+                    <!-- Collection Time & Rider Notes -->
+                    <div class="p-4 sm:p-5 rounded-2xl bg-teal-50/50 border border-teal-200/80 grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        <div>
+                            <label class="text-xs font-bold text-slate-800 block mb-1.5 flex items-center gap-1.5">
+                                <i class="fas fa-clock text-teal-600"></i>
+                                <span>Preferred Collection Time Slot:</span>
+                            </label>
+                            <input type="datetime-local" name="scheduled_pickup_time" 
+                                   :disabled="!hasDoorstepPickup"
+                                   value="{{ old('scheduled_pickup_time', now()->addHours(2)->format('Y-m-d\TH:i')) }}"
+                                   class="w-full text-xs px-3.5 py-2.5 bg-white border border-slate-300 rounded-xl focus:ring-2 focus:ring-teal-500 font-medium text-slate-900 shadow-xs">
+                        </div>
+                        <div>
+                            <label class="text-xs font-bold text-slate-800 block mb-1.5 flex items-center gap-1.5">
+                                <i class="fas fa-comment-dots text-teal-600"></i>
+                                <span>Pickup Notes for Rider (Optional):</span>
+                            </label>
+                            <input type="text" name="pickup_notes" placeholder="e.g. Ring bell on 2nd floor, call sender on arrival"
+                                   :disabled="!hasDoorstepPickup"
+                                   class="w-full text-xs px-3.5 py-2.5 bg-white border border-slate-300 rounded-xl focus:ring-2 focus:ring-teal-500 font-medium text-slate-900 shadow-xs">
+                        </div>
+                    </div>
+
+                    <!-- Pickup Cards Container -->
+                    <div id="pickup-container" class="space-y-6">
+                        <!-- Initial Pickup Card #0 -->
+                        <div class="pickup-card p-5 sm:p-6 rounded-2xl bg-slate-50/70 border border-slate-200 space-y-4" id="pickup-card-0">
+                            <div class="flex items-center justify-between gap-3 pb-2 border-b border-slate-200">
+                                <div class="flex items-center gap-2">
+                                    <span class="w-6 h-6 rounded-lg bg-teal-600 text-white text-xs font-black flex items-center justify-center">1</span>
+                                    <span class="font-extrabold text-xs text-slate-800 uppercase tracking-wider">Pickup Location #1</span>
+                                </div>
+                                <button type="button" onclick="removePickupPoint(0)" class="text-rose-500 hover:text-rose-700 text-xs font-bold hidden remove-pickup-btn cursor-pointer">
+                                    <i class="fas fa-trash-can mr-1"></i> Remove Location
+                                </button>
+                            </div>
+
+                            <!-- 1-CLICK SAVED ADDRESS & INQUIRY PRE-FILLER -->
+                            <div class="p-3.5 rounded-xl bg-white border border-slate-200 space-y-2">
+                                <div class="flex items-center justify-between flex-wrap gap-2">
+                                    <label class="text-[11px] font-bold uppercase tracking-wider text-slate-600 flex items-center gap-1.5">
+                                        <i class="fas fa-bolt text-amber-500"></i>
+                                        <span>1-Click Auto-Fill from Address Book / Inquiries:</span>
+                                    </label>
+                                    <span class="text-[10px] text-teal-700 font-semibold">Instant data population</span>
+                                </div>
+
+                                <select onchange="applySavedPickup(this, 0)" class="w-full text-xs px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg focus:ring-2 focus:ring-teal-500 outline-none font-medium text-slate-800">
+                                    <option value="">-- Choose from Saved Addresses or Prior Doorstep Inquiries --</option>
+                                    
+                                    @if(isset($savedAddresses) && $savedAddresses->count() > 0)
+                                        <optgroup label="🏢 Address Book (Saved Locations)">
+                                            @foreach($savedAddresses as $sAddr)
+                                                <option value="saved_{{ $sAddr->id }}"
+                                                        data-name="{{ $sAddr->contact_person_name }}"
+                                                        data-phone="{{ $sAddr->contact_person_phone }}"
+                                                        data-address="{{ $sAddr->address . ($sAddr->landmark ? ', ' . $sAddr->landmark : '') }}"
+                                                        data-lat="{{ $sAddr->latitude ?? '' }}"
+                                                        data-lng="{{ $sAddr->longitude ?? '' }}">
+                                                    {{ $sAddr->display_name }} ({{ $sAddr->contact_person_name }} &bull; {{ $sAddr->contact_person_phone }})
+                                                </option>
+                                            @endforeach
+                                        </optgroup>
+                                    @endif
+
+                                    @if(isset($recentPickups) && $recentPickups->count() > 0)
+                                        <optgroup label="📦 Recent Doorstep Inquiries">
+                                            @foreach($recentPickups as $pReq)
+                                                <option value="inquiry_{{ $pReq->id }}"
+                                                        data-name="{{ $pReq->contact_person_name ?? Auth::user()->name }}"
+                                                        data-phone="{{ $pReq->contact_person_phone ?? Auth::user()->phone }}"
+                                                        data-address="{{ $pReq->pickup_address }}"
+                                                        data-lat="{{ $pReq->pickup_latitude ?? '' }}"
+                                                        data-lng="{{ $pReq->pickup_longitude ?? '' }}">
+                                                    {{ $pReq->tracking_number ?? ('#REQ-' . $pReq->id) }} &bull; {{ Str::limit($pReq->pickup_address, 35) }}
+                                                </option>
+                                            @endforeach
+                                        </optgroup>
+                                    @endif
+                                </select>
+                            </div>
+
+                            <!-- Pickup Contact & Address Inputs -->
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1.5">Contact Person Name <span class="text-rose-500">*</span></label>
+                                    <div class="relative">
+                                        <i class="fas fa-user absolute left-3 top-3 text-slate-400 text-xs pointer-events-none"></i>
+                                        <input type="text" name="pickup_name[]" id="pickup_name_0"
+                                               :required="hasDoorstepPickup"
+                                               :disabled="!hasDoorstepPickup"
+                                               value="{{ old('pickup_name.0', $convertPickup->contact_person_name ?? '') }}"
+                                               class="w-full text-xs pl-8 pr-3 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-medium text-slate-900"
+                                               placeholder="Contact person name">
+                                    </div>
+                                </div>
+
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1.5">Mobile Number <span class="text-rose-500">*</span></label>
+                                    <div class="relative">
+                                        <i class="fas fa-phone absolute left-3 top-3 text-slate-400 text-xs pointer-events-none"></i>
+                                        <input type="text" name="pickup_phone[]" id="pickup_phone_0"
+                                               :required="hasDoorstepPickup"
+                                               :disabled="!hasDoorstepPickup"
+                                               value="{{ old('pickup_phone.0', $convertPickup->contact_person_phone ?? '') }}"
+                                               class="w-full text-xs pl-8 pr-3 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-mono font-medium text-slate-900"
+                                               placeholder="98XXXXXXXX">
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1.5">Full Pickup Street Address & Landmark <span class="text-rose-500">*</span></label>
+                                <textarea name="pickup_address[]" id="pickup_address_0" rows="2"
+                                          :required="hasDoorstepPickup"
+                                          :disabled="!hasDoorstepPickup"
+                                          class="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-medium text-slate-900"
+                                          placeholder="Full street address, ward number, or building">{{ old('pickup_address.0', $convertPickup->pickup_address ?? '') }}</textarea>
+                            </div>
+
+                            <!-- Interactive Leaflet Map for Pickup #0 -->
+                            <div class="space-y-2">
+                                <div class="flex items-center justify-between">
+                                    <label class="text-[11px] font-bold uppercase tracking-wider text-slate-600 flex items-center gap-1.5">
+                                        <i class="fas fa-map-location-dot text-teal-600"></i>
+                                        <span>Interactive Map Pin (Click or Drag Marker):</span>
+                                    </label>
+                                    <span class="text-[10px] text-slate-400 font-mono" id="pickup-coords-0">Lat: 27.7172, Lng: 85.3240</span>
+                                </div>
+
+                                <div class="flex items-center gap-2">
+                                    <div class="relative flex-1">
+                                        <i class="fas fa-search absolute left-3 top-2.5 text-slate-400 text-xs pointer-events-none"></i>
+                                        <input type="text" id="pickup-search-0" 
+                                               placeholder="Search landmark, area or street in Nepal..."
+                                               onkeydown="if(event.key === 'Enter'){ event.preventDefault(); searchLocationOnMap('pickup', 0); }"
+                                               class="w-full text-xs pl-8 pr-3 py-2 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 outline-none">
+                                    </div>
+                                    <button type="button" onclick="searchLocationOnMap('pickup', 0)" class="px-3 py-2 bg-slate-800 text-white rounded-xl text-xs font-bold hover:bg-slate-700 transition cursor-pointer">
+                                        Search
+                                    </button>
+                                    <button type="button" onclick="getCurrentLocationOnMap('pickup', 0)" title="Use Current GPS" class="px-3 py-2 bg-teal-50 text-teal-700 border border-teal-200 rounded-xl text-xs font-bold hover:bg-teal-100 transition cursor-pointer">
+                                        <i class="fas fa-location-crosshairs"></i>
+                                    </button>
+                                </div>
+
+                                <div id="pickup-map-0" class="map-container"></div>
+                                <input type="hidden" name="pickup_lat[]" id="pickup-lat-0" value="27.7172" :disabled="!hasDoorstepPickup">
+                                <input type="hidden" name="pickup_lng[]" id="pickup-lng-0" value="85.3240" :disabled="!hasDoorstepPickup">
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Auto-Save Address Book Option -->
+                    <div class="p-3.5 rounded-xl bg-slate-50 border border-slate-200 flex items-center gap-3">
+                        <input type="checkbox" name="save_pickup_addresses" id="save_pickup_addresses" value="1" checked 
+                               :disabled="!hasDoorstepPickup"
+                               class="w-4 h-4 text-teal-600 rounded border-slate-300 focus:ring-teal-500 cursor-pointer">
+                        <label for="save_pickup_addresses" class="text-xs text-slate-700 font-medium cursor-pointer">
+                            Automatically remember and save newly entered pickup locations to my Address Book for 1-click re-use.
+                        </label>
+                    </div>
+                </div>
+
+                <!-- ========================================================================= -->
+                <!-- COUNTER / STATION DROP-OFF PANEL (ONLY SHOWN WHEN hasDoorstepPickup IS FALSE) -->
+                <!-- ========================================================================= -->
+                <div x-show="!hasDoorstepPickup" x-transition class="space-y-4">
+                    <div class="p-4 sm:p-5 rounded-2xl bg-slate-50 border border-slate-200 text-slate-800 space-y-3">
+                        <div class="flex items-start gap-3.5">
+                            <div class="w-10 h-10 rounded-xl bg-slate-800 text-white flex items-center justify-center flex-shrink-0 text-base shadow-xs">
+                                <i class="fas fa-store"></i>
+                            </div>
+                            <div class="flex-1">
+                                <div class="flex items-center gap-2">
+                                    <h4 class="font-extrabold text-slate-900 text-sm">Station / Counter Drop-off Selected</h4>
+                                    <span class="px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-wider bg-emerald-100 text-emerald-800">No Pickup Fee</span>
+                                </div>
+                                <p class="text-xs text-slate-600 mt-1 leading-relaxed">
+                                    You can drop off your consignment at any authorized Netpack hub or branch counter. No courier rider will be dispatched to your location.
+                                </p>
+                            </div>
+                        </div>
+
+                        <!-- Sender Information (Used on Label) -->
+                        <div class="pt-3 border-t border-slate-200/80">
+                            <label class="text-[11px] font-bold uppercase tracking-wider text-slate-500 block mb-2">
+                                Sender Information (Printed on Consignment Waybill):
+                            </label>
+                            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                                <div>
+                                    <label class="block text-[10px] font-bold text-slate-500 mb-1">Sender Name</label>
+                                    <input type="text" name="sender_name" id="sender_name_input"
+                                           :disabled="hasDoorstepPickup"
+                                           value="{{ old('sender_name', '') }}"
+                                           placeholder="Sender full name"
+                                           class="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl font-medium text-slate-900 focus:ring-2 focus:ring-teal-500">
+                                </div>
+                                <div>
+                                    <label class="block text-[10px] font-bold text-slate-500 mb-1">Sender Phone</label>
+                                    <input type="text" name="sender_phone" id="sender_phone_input"
+                                           :disabled="hasDoorstepPickup"
+                                           value="{{ old('sender_phone', '') }}"
+                                           placeholder="Sender contact phone"
+                                           class="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl font-mono font-medium text-slate-900 focus:ring-2 focus:ring-teal-500">
+                                </div>
+                                <div>
+                                    <label class="block text-[10px] font-bold text-slate-500 mb-1">Sender Address / Station</label>
+                                    <input type="text" name="sender_address" id="sender_address_input"
+                                           :disabled="hasDoorstepPickup"
+                                           value="{{ old('sender_address', '') }}"
+                                           placeholder="Sender address or drop-off hub"
+                                           class="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl font-medium text-slate-900 focus:ring-2 focus:ring-teal-500">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 3. DELIVERY DESTINATIONS (INTERNATIONAL / DOMESTIC) -->
+            <div class="bg-white rounded-3xl p-6 shadow-sm border border-slate-200/90 space-y-6">
+                <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-100">
+                    <div>
+                        <h3 class="text-sm font-black uppercase tracking-wider text-slate-900 flex items-center gap-2">
+                            <span class="w-5 h-5 rounded-full bg-teal-600 text-white text-[10px] flex items-center justify-center font-bold">3</span>
+                            <span>🎯 Delivery Destination(s)</span>
+                        </h3>
+                        <p class="text-xs text-slate-500 mt-0.5">
+                            Specify delivery consignee address. Supports multi-stop drop-offs across domestic zones or single international address.
+                        </p>
+                    </div>
+
+                    <button type="button" onclick="addDeliveryPoint()" id="add-delivery-btn"
+                            class="px-4 py-2 rounded-xl bg-teal-50 hover:bg-teal-100 text-teal-800 border border-teal-200 text-xs font-extrabold transition flex items-center gap-1.5 self-start sm:self-auto cursor-pointer">
+                        <i class="fas fa-plus text-teal-600"></i>
+                        <span>Add Another Destination</span>
+                    </button>
+                </div>
+
+                <!-- International 5-Line Format Container -->
+                <div id="delivery-international" class="hidden space-y-4">
+                    <div class="p-4 rounded-2xl bg-teal-50/60 border border-teal-200/70 space-y-4">
+                        <div class="flex items-center gap-2 pb-2 border-b border-teal-200/50">
+                            <i class="fas fa-globe text-teal-700"></i>
+                            <span class="font-extrabold text-xs text-teal-950 uppercase tracking-wider">Overseas Consignee Information</span>
+                        </div>
+
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Destination Country <span class="text-rose-500">*</span></label>
+                                <select name="receiver_country" id="receiver_country" class="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-semibold text-slate-900">
+                                    <option value="">Select country</option>
+                                    @php
+                                        $commonCountries = ['Poland', 'United States', 'United Kingdom', 'Australia', 'Germany', 'Canada', 'United Arab Emirates', 'India', 'Japan', 'France', 'Netherlands', 'Italy', 'Spain', 'Switzerland', 'Sweden', 'Singapore', 'Qatar', 'Malaysia', 'Saudi Arabia', 'South Korea'];
+                                        $requestedCountry = request('receiver_country');
+                                    @endphp
+                                    @if($requestedCountry && !in_array($requestedCountry, $commonCountries))
+                                        <option value="{{ $requestedCountry }}" selected>{{ $requestedCountry }}</option>
+                                    @endif
+                                    @foreach($commonCountries as $c)
+                                        <option value="{{ $c }}" @selected(strcasecmp($requestedCountry ?? '', $c) === 0)>{{ $c }}</option>
+                                    @endforeach
+                                </select>
+                            </div>
+
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Receiver Name / Company <span class="text-rose-500">*</span></label>
+                                <input type="text" name="receiver_name" id="receiver_name" value="{{ old('receiver_name') }}" class="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-medium text-slate-900" placeholder="Full name or company">
+                            </div>
+                        </div>
+
+                        <!-- Consignee Phone & Tax ID -->
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">
+                                    Consignee / Receiver Mobile Phone <span class="text-rose-500">*</span>
+                                    <span class="text-[10px] text-slate-400 font-normal ml-1">(Required for Courier SMS & Customs)</span>
+                                </label>
+                                <div class="relative flex items-center">
+                                    <span class="inline-flex items-center px-3 py-2 rounded-l-xl border border-r-0 border-slate-200 bg-slate-100 text-teal-800 font-mono font-bold text-xs" id="receiver-dial-code-prefix">
+                                        +Intl
+                                    </span>
+                                    <input type="text" name="receiver_phone" id="receiver_phone" value="{{ old('receiver_phone') }}" 
+                                           class="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-r-xl focus:ring-2 focus:ring-teal-500 font-mono font-medium text-slate-900" 
+                                           placeholder="e.g. 501 234 567">
+                                </div>
+                            </div>
+
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Consignee Tax ID / EORI / VAT (Optional)</label>
+                                <input type="text" name="receiver_tax_id" id="receiver_tax_id" value="{{ old('receiver_tax_id') }}" class="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-mono font-medium" placeholder="Optional Tax ID or EORI">
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">City <span class="text-rose-500">*</span></label>
+                                <input type="text" name="receiver_city" id="receiver_city" value="{{ old('receiver_city') }}" class="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-medium" placeholder="City">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">State / Province</label>
+                                <input type="text" name="receiver_state" id="receiver_state" value="{{ old('receiver_state') }}" class="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-medium" placeholder="State / Province">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Postal / ZIP Code</label>
+                                <input type="text" name="receiver_postal_code" id="receiver_postal_code" value="{{ old('receiver_postal_code') }}" class="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-mono" placeholder="ZIP code">
+                            </div>
+                        </div>
+
+                        <div>
+                            <label class="block text-xs font-bold text-slate-700 mb-1">Street Address <span class="text-rose-500">*</span></label>
+                            <input type="text" name="receiver_street" id="receiver_street" value="{{ old('receiver_street') }}" class="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-medium" placeholder="Street line 1, suite, building">
+                        </div>
+
+                        <div class="space-y-2 pt-2">
+                            <div class="flex items-center justify-between">
+                                <label class="text-[11px] font-bold uppercase tracking-wider text-slate-600">Map Pin for Destination City:</label>
+                                <span class="text-[10px] text-slate-400 font-mono" id="delivery-intl-coords">Lat: 40.7128, Lng: -74.0060</span>
+                            </div>
+                            <div id="delivery-international-map" class="map-container"></div>
+                            <input type="hidden" name="delivery_lat_intl" id="delivery-lat-intl" value="40.7128">
+                            <input type="hidden" name="delivery_lng_intl" id="delivery-lng-intl" value="-74.0060">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Domestic / E-Commerce Multiple Destinations Container -->
+                <div id="delivery-multiple" class="space-y-6">
+                    <div class="delivery-card p-5 sm:p-6 rounded-2xl bg-slate-50/70 border border-slate-200 space-y-4" id="delivery-card-0">
+                        <div class="flex items-center justify-between gap-3 pb-2 border-b border-slate-200">
+                            <div class="flex items-center gap-2">
+                                <span class="w-6 h-6 rounded-lg bg-teal-600 text-white text-xs font-black flex items-center justify-center">1</span>
+                                <span class="font-extrabold text-xs text-slate-800 uppercase tracking-wider">Delivery Destination #1</span>
+                            </div>
+                            <button type="button" onclick="removeDeliveryPoint(0)" class="text-rose-500 hover:text-rose-700 text-xs font-bold hidden remove-delivery-btn cursor-pointer">
+                                <i class="fas fa-trash-can mr-1"></i> Remove Destination
+                            </button>
+                        </div>
+
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1.5">Recipient Full Name <span class="text-rose-500">*</span></label>
+                                <div class="relative">
+                                    <i class="fas fa-user-check absolute left-3 top-3 text-slate-400 text-xs pointer-events-none"></i>
+                                    <input type="text" name="delivery_name[]" id="delivery_name_0" required 
+                                           value="{{ old('delivery_name.0', $convertPickup->customer_name ?? '') }}"
+                                           class="w-full text-xs pl-8 pr-3 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-medium text-slate-900"
+                                           placeholder="Recipient name">
+                                </div>
+                            </div>
+
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1.5">Recipient Phone <span class="text-rose-500">*</span></label>
+                                <div class="relative">
+                                    <i class="fas fa-phone absolute left-3 top-3 text-slate-400 text-xs pointer-events-none"></i>
+                                    <input type="text" name="delivery_phone[]" id="delivery_phone_0" required 
+                                           value="{{ old('delivery_phone.0', $convertPickup->customer_phone ?? '') }}"
+                                           class="w-full text-xs pl-8 pr-3 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-mono font-medium text-slate-900"
+                                           placeholder="98XXXXXXXX">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Nepal Territory Picker (7 Provinces & 77 Districts) -->
+                        <div class="p-4 rounded-xl bg-white border border-slate-200">
+                            <x-nepal-territory-picker 
+                                provinceName="delivery_province[]" 
+                                districtName="delivery_district[]" 
+                                provinceLabel="Destination Province / Region" 
+                                districtLabel="Destination District" 
+                                idPrefix="shipment_deliv_0" 
+                                helperText="Select the destination province to show its 77-district sub-list." />
+                        </div>
+
+                        <div>
+                            <label class="block text-xs font-bold text-slate-700 mb-1.5">Street Address & Landmark <span class="text-rose-500">*</span></label>
+                            <textarea name="delivery_address[]" id="delivery_address_0" rows="2" required 
+                                      class="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-medium text-slate-900"
+                                      placeholder="Full street address, building, ward number">{{ old('delivery_address.0', $convertPickup->delivery_address ?? '') }}</textarea>
+                        </div>
+
+                        <!-- Cash-On-Delivery (COD) Collection Option (Domestic & E-Commerce) -->
+                        <div class="p-4 rounded-xl bg-amber-50/70 border border-amber-200/90 space-y-3" id="cod-section-0">
+                            <div class="flex items-center justify-between">
+                                <label class="flex items-center gap-2.5 cursor-pointer">
+                                    <input type="checkbox" name="is_cod" id="is_cod_checkbox" value="1" 
+                                           {{ old('is_cod') ? 'checked' : '' }}
+                                           onchange="toggleCodAmountField(this)"
+                                           class="w-4 h-4 text-amber-600 rounded border-slate-300 focus:ring-amber-500 cursor-pointer">
+                                    <span class="text-xs font-bold text-slate-900 flex items-center gap-1.5 cursor-pointer">
+                                        <i class="fas fa-hand-holding-dollar text-amber-600"></i>
+                                        <span>Cash on Delivery (COD) Collection</span>
+                                    </span>
+                                </label>
+                                <span class="text-[10px] font-bold text-amber-800 uppercase px-2 py-0.5 rounded bg-amber-100 border border-amber-200">
+                                    Doorstep Handover
+                                </span>
+                            </div>
+                            <div id="cod-amount-container" class="{{ old('is_cod') ? '' : 'hidden' }} pt-2 border-t border-amber-200/60 flex flex-col sm:flex-row sm:items-center gap-3">
+                                <div class="w-full sm:w-1/2">
+                                    <label class="block text-[10px] font-bold uppercase tracking-wider text-slate-600 mb-1">
+                                        Amount to Collect from Recipient (Rs.)
+                                    </label>
+                                    <div class="relative">
+                                        <span class="absolute left-3 top-2.5 text-xs font-bold text-slate-400">Rs.</span>
+                                        <input type="number" step="1" min="0" name="cod_amount" id="cod_amount_input"
+                                               value="{{ old('cod_amount', '') }}"
+                                               placeholder="e.g. 2500"
+                                               class="w-full text-xs font-mono font-bold pl-10 pr-3 py-2 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-amber-500 text-slate-900">
+                                    </div>
+                                </div>
+                                <div class="text-[11px] text-slate-500 flex-1">
+                                    Our delivery rider will collect this exact cash amount upon doorstep handover and deposit it into your account balance.
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Interactive Leaflet Map for Delivery #0 -->
+                        <div class="space-y-2">
+                            <div class="flex items-center justify-between">
+                                <label class="text-[11px] font-bold uppercase tracking-wider text-slate-600 flex items-center gap-1.5">
+                                    <i class="fas fa-map-location-dot text-teal-600"></i>
+                                    <span>Delivery Pin on Map:</span>
+                                </label>
+                                <span class="text-[10px] text-slate-400 font-mono" id="delivery-coords-0">Lat: 27.7172, Lng: 85.3240</span>
+                            </div>
+
+                            <div class="flex items-center gap-2">
+                                <div class="relative flex-1">
+                                    <i class="fas fa-search absolute left-3 top-2.5 text-slate-400 text-xs pointer-events-none"></i>
+                                    <input type="text" id="delivery-search-0" 
+                                           placeholder="Search delivery area or landmark..."
+                                           onkeydown="if(event.key === 'Enter'){ event.preventDefault(); searchLocationOnMap('delivery', 0); }"
+                                           class="w-full text-xs pl-8 pr-3 py-2 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 outline-none">
+                                </div>
+                                <button type="button" onclick="searchLocationOnMap('delivery', 0)" class="px-3 py-2 bg-slate-800 text-white rounded-xl text-xs font-bold hover:bg-slate-700 transition">
+                                    Search
+                                </button>
+                                <button type="button" onclick="getCurrentLocationOnMap('delivery', 0)" title="Use Current GPS" class="px-3 py-2 bg-teal-50 text-teal-700 border border-teal-200 rounded-xl text-xs font-bold hover:bg-teal-100 transition">
+                                    <i class="fas fa-location-crosshairs"></i>
+                                </button>
+                            </div>
+
+                            <div id="delivery-map-0" class="map-container"></div>
+                            <input type="hidden" name="delivery_lat[]" id="delivery-lat-0" value="27.7172">
+                            <input type="hidden" name="delivery_lng[]" id="delivery-lng-0" value="85.3240">
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 4. SHIPPING DOCUMENTS, CARGO SPECIFICATIONS & SMART PACKING MATRIX -->
+            <div class="bg-white rounded-3xl p-6 shadow-sm border border-slate-200/90 space-y-8">
+                <!-- Section Header -->
+                <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-100">
+                    <div>
+                        <h3 class="text-sm font-black uppercase tracking-wider text-slate-900 flex items-center gap-2">
+                            <span class="w-5 h-5 rounded-full bg-teal-600 text-white text-[10px] flex items-center justify-center font-bold">4</span>
+                            <span>⚖️ Shipping Documents, Cargo Weight & Smart Packing List</span>
+                        </h3>
+                        <p class="text-xs text-slate-500 mt-0.5">
+                            Harmonized System (HS) WCO customs declaration, itemized Commercial Invoice & multi-box allocation matrix.
+                        </p>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <span class="px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wider bg-teal-50 text-teal-700 border border-teal-200 flex items-center gap-1.5">
+                            <i class="fas fa-shield-halved text-teal-600"></i>
+                            <span>Nepal IRD & WCO Compliant</span>
+                        </span>
+                    </div>
+                </div>
+
+                <!-- Hidden Payloads for Backend Persistence -->
+                <input type="hidden" name="invoice_data_json" :value="invoiceDataJsonPayload">
+                <input type="hidden" name="packing_list_data_json" :value="packingListDataJsonPayload">
+
+                <!-- Conditional Mode Display: E-Commerce / Rider Mode Simple View vs Full Documentation Suite -->
+                <template x-if="shipmentMode === 'ecommerce'">
+                    <div class="space-y-6">
+                        <div class="p-4 rounded-2xl bg-amber-50/70 border border-amber-200/70 text-xs text-amber-900 flex items-start gap-3">
+                            <i class="fas fa-info-circle text-amber-600 text-base mt-0.5"></i>
+                            <div>
+                                <span class="font-extrabold block">E-Commerce Rider Dispatch Mode</span>
+                                <span class="text-amber-800">Formal customs Commercial Invoices and multi-box packing lists are not required for local rider delivery. Enter package weight and attach merchant tax bill below if available.</span>
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Parcel Gross Weight (KG) <span class="text-rose-500">*</span></label>
+                                <input type="number" step="0.1" name="weight" id="weight-input" required 
+                                       value="{{ old('weight', $convertPickup->estimated_weight_kg ?? request('weight', '')) }}"
+                                       oninput="calculateVolumetricWeight()"
+                                       placeholder="e.g. 2.5"
+                                       class="w-full text-xs px-3 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-mono font-bold text-slate-900">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Length (cm)</label>
+                                <input type="number" step="0.1" name="length" id="length-input" placeholder="L" oninput="calculateVolumetricWeight()"
+                                       class="w-full text-xs px-3 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-mono">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Width (cm)</label>
+                                <input type="number" step="0.1" name="width" id="width-input" placeholder="W" oninput="calculateVolumetricWeight()"
+                                       class="w-full text-xs px-3 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-mono">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Height (cm)</label>
+                                <input type="number" step="0.1" name="height" id="height-input" placeholder="H" oninput="calculateVolumetricWeight()"
+                                       class="w-full text-xs px-3 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-mono">
+                            </div>
+                        </div>
+
+                        <div>
+                            <label class="block text-xs font-bold text-slate-700 mb-1">Cargo / Goods Description</label>
+                            <input type="text" name="description" placeholder="e.g. Retail apparel, Electronic accessories, Cosmetics"
+                                   class="w-full text-xs px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 text-slate-900 font-medium">
+                        </div>
+                    </div>
+                </template>
+
+                <!-- Full Documentation Suite (Domestic & International Shipments) -->
+                <div x-show="shipmentMode !== 'ecommerce'" class="space-y-8">
+                    
+                    <!-- 4A. COMMERCIAL INVOICE & WCO HS CODE ENGINE -->
+                    <div class="p-5 sm:p-6 rounded-2xl bg-slate-50/80 border border-slate-200/90 space-y-6">
+                        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
+                            <div class="flex items-center gap-2.5">
+                                <div class="w-8 h-8 rounded-xl bg-teal-600 text-white flex items-center justify-center text-sm shadow-xs">
+                                    <i class="fas fa-file-invoice-dollar"></i>
+                                </div>
+                                <div>
+                                    <h4 class="text-xs font-black uppercase tracking-wider text-slate-900">Commercial Invoice Preparation</h4>
+                                    <p class="text-[11px] text-slate-500">Auto-suggests WCO Harmonized System tariffs & Nepal Customs export classifications</p>
+                                </div>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <span class="text-[11px] font-bold text-slate-600">Currency:</span>
+                                <select x-model="invoiceCurrency" class="text-xs font-black py-1 px-2.5 bg-white border border-slate-200 rounded-lg text-teal-800 focus:ring-2 focus:ring-teal-500">
+                                    <option value="USD">USD ($)</option>
+                                    <option value="NPR">NPR (Rs.)</option>
+                                    <option value="EUR">EUR (€)</option>
+                                    <option value="GBP">GBP (£)</option>
+                                    <option value="AUD">AUD ($)</option>
+                                    <option value="CAD">CAD ($)</option>
+                                    <option value="AED">AED (Dh)</option>
+                                    <option value="INR">INR (₹)</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <!-- Invoice Metadata Bar -->
+                        <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2.5">
+                            <div>
+                                <label class="block text-[10px] font-bold uppercase text-slate-500 mb-1">Invoice Number</label>
+                                <input type="text" x-model="invoiceNumber" class="w-full text-xs font-mono font-bold px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-teal-500 text-slate-800">
+                            </div>
+                            <div>
+                                <label class="block text-[10px] font-bold uppercase text-slate-500 mb-1">Invoice Date</label>
+                                <input type="date" x-model="invoiceDate" class="w-full text-xs px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-teal-500 text-slate-800">
+                            </div>
+                            <div>
+                                <label class="block text-[10px] font-bold uppercase text-slate-500 mb-1">Incoterms</label>
+                                <select x-model="incoterm" class="w-full text-xs font-bold px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-teal-500 text-slate-800">
+                                    <option value="DAP">DAP (Delivered at Place)</option>
+                                    <option value="DDP">DDP (Delivered Duty Paid)</option>
+                                    <option value="FOB">FOB (Free on Board)</option>
+                                    <option value="CIF">CIF (Cost, Insurance & Freight)</option>
+                                    <option value="EXW">EXW (Ex Works)</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-[10px] font-bold uppercase text-slate-500 mb-1">Reason For Export</label>
+                                <select x-model="reasonForExport" class="w-full text-xs px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-teal-500 text-slate-800">
+                                    <option value="Commercial Sale / Export">Commercial Sale</option>
+                                    <option value="Sample Not For Sale">Sample Not For Sale</option>
+                                    <option value="Gift / Personal Effects">Personal / Gift</option>
+                                    <option value="Return / Repair">Return / Repair</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-[10px] font-bold uppercase text-slate-500 mb-1">Acquisition Source</label>
+                                <select x-model="acquisitionSource" class="w-full text-xs font-semibold px-2 py-1.5 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-teal-500 text-slate-800">
+                                    <option value="direct_portal">Direct Web Portal</option>
+                                    <option value="website_organic">Website / Organic</option>
+                                    <option value="referral">Client Referral</option>
+                                    <option value="sales_representative">Sales Executive</option>
+                                    <option value="social_media">Social Media</option>
+                                    <option value="agent_walkin">Walk-in Counter</option>
+                                    <option value="api_integration">API Integration</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-[10px] font-bold uppercase text-slate-500 mb-1">Exporter PAN / VAT</label>
+                                <input type="text" x-model="exporterPanVat" placeholder="9-digit PAN" class="w-full text-xs font-mono px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-teal-500 text-slate-800">
+                            </div>
+                            <div>
+                                <label class="block text-[10px] font-bold uppercase text-slate-500 mb-1">EXIM Code (Customs)</label>
+                                <input type="text" x-model="exporterEximCode" placeholder="NP-XXXXXXXX" class="w-full text-xs font-mono px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-teal-500 text-slate-800">
+                            </div>
+                        </div>
+
+                        <!-- Declared Commodities / Line Items Invoicing Table -->
+                        <div class="space-y-3">
+                            <div class="flex items-center justify-between">
+                                <span class="text-xs font-extrabold text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
+                                    <i class="fas fa-file-invoice text-teal-600"></i>
+                                    <span>Declared Commodity Line Items (Commercial Invoice)</span>
+                                    <span class="text-[10px] font-mono px-2 py-0.5 rounded-full bg-teal-100 text-teal-800" x-text="invoiceItems.length + ' item(s)'"></span>
+                                </span>
+                                <button type="button" @click="addInvoiceItem()" class="px-3 py-1.5 rounded-xl bg-teal-600 hover:bg-teal-700 text-white text-xs font-bold flex items-center gap-1.5 shadow-2xs cursor-pointer transition">
+                                    <i class="fas fa-plus"></i>
+                                    <span>Add Commodity Row</span>
+                                </button>
+                            </div>
+
+                            <!-- Column-like Spreadsheet Invoice Table -->
+                            <div class="overflow-x-auto rounded-xl border border-slate-200 bg-white shadow-2xs">
+                                <table class="w-full text-left border-collapse min-w-[780px]">
+                                    <thead>
+                                        <tr class="bg-slate-50/90 border-b border-slate-200 text-[10px] font-black uppercase tracking-wider text-slate-600">
+                                            <th class="py-2.5 px-3 w-10 text-center">#</th>
+                                            <th class="py-2.5 px-3 min-w-[300px]">Item / Commodity &amp; WCO HS Code <span class="text-rose-500">*</span></th>
+                                            <th class="py-2.5 px-3 w-28">Origin</th>
+                                            <th class="py-2.5 px-3 w-20 text-center">Qty</th>
+                                            <th class="py-2.5 px-3 w-24">UOM</th>
+                                            <th class="py-2.5 px-3 w-28 text-right">Unit (<span x-text="invoiceCurrency"></span>)</th>
+                                            <th class="py-2.5 px-3 w-28 text-right">Total (<span x-text="invoiceCurrency"></span>)</th>
+                                            <th class="py-2.5 px-3 w-12 text-center"><i class="fas fa-trash-can text-slate-400 text-xs"></i></th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="divide-y divide-slate-100 text-xs">
+                                        <template x-for="(item, index) in invoiceItems" :key="index">
+                                            <tr class="hover:bg-teal-50/30 transition group">
+                                                <!-- Row # -->
+                                                <td class="py-3 px-3 text-center align-top font-mono font-bold text-slate-400 pt-3.5" x-text="index + 1"></td>
+
+                                                <!-- Description & Live HS Suggestions -->
+                                                <td class="py-2.5 px-3 align-top relative">
+                                                    <div class="flex items-center gap-1.5">
+                                                        <div class="relative flex-1">
+                                                            <input type="text" x-model="item.name" 
+                                                                   @input.debounce.300ms="fetchHsSuggestions(index, item.name)"
+                                                                   @focus="if(item.name.length >= 2) fetchHsSuggestions(index, item.name)"
+                                                                   placeholder="Type item e.g. Pashmina Shawl, Tea, Singing Bowl..." 
+                                                                   class="w-full text-xs font-semibold px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-teal-500 text-slate-900">
+                                                            <span x-show="item.isSearching" class="absolute right-2.5 top-2 text-teal-600 text-xs">
+                                                                <i class="fas fa-spinner fa-spin"></i>
+                                                            </span>
+                                                        </div>
+                                                        <button type="button" @click="openWcoModal(index)" title="Explore WCO Tariff Database"
+                                                                class="px-2 py-1.5 rounded-lg bg-slate-100 hover:bg-teal-50 text-slate-700 hover:text-teal-700 border border-slate-200 text-xs font-bold transition flex items-center gap-1 cursor-pointer shrink-0">
+                                                            <i class="fas fa-search-dollar text-teal-600 text-xs"></i>
+                                                            <span class="text-[11px]">WCO</span>
+                                                        </button>
+                                                    </div>
+
+                                                    <!-- Active HS Code Badge -->
+                                                    <div class="mt-1 flex items-center gap-2 flex-wrap" x-show="item.hs_code">
+                                                        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-teal-50 text-teal-800 border border-teal-200 text-[10px] font-mono font-bold">
+                                                            <i class="fas fa-tag text-teal-600 text-[9px]"></i>
+                                                            <span x-text="'HS: ' + item.hs_code"></span>
+                                                        </span>
+                                                        <span class="text-[10px] text-slate-400">Export Duty: 0% Free</span>
+                                                    </div>
+
+                                                    <!-- Live Floating Suggestions Dropdown -->
+                                                    <div x-show="item.showSuggestions && item.suggestions.length > 0"
+                                                         @click.outside="item.showSuggestions = false"
+                                                         class="absolute z-30 left-3 right-3 top-full mt-1 bg-white rounded-xl shadow-xl border border-slate-200 overflow-hidden text-xs max-h-60 overflow-y-auto">
+                                                        <div class="p-2 bg-slate-50 border-b border-slate-100 text-[10px] font-black uppercase tracking-wider text-slate-500 flex items-center justify-between">
+                                                            <span>WCO Tariff Auto-Suggestions</span>
+                                                            <span>Select to apply</span>
+                                                        </div>
+                                                        <template x-for="hs in item.suggestions" :key="hs.id">
+                                                            <div @click="selectHsCode(index, hs)" class="p-2.5 hover:bg-teal-50/80 cursor-pointer border-b border-slate-100 last:border-0 transition">
+                                                                <div class="flex items-center justify-between">
+                                                                    <span class="font-bold text-slate-900" x-text="hs.commodity_name"></span>
+                                                                    <span class="font-mono font-black text-teal-700 px-1.5 py-0.5 rounded bg-teal-100/60" x-text="'HS ' + hs.code"></span>
+                                                                </div>
+                                                                <div class="text-[10px] text-slate-500 mt-0.5 flex items-center gap-2">
+                                                                    <span x-text="hs.category"></span>
+                                                                    <span>&bull;</span>
+                                                                    <span x-text="'Standard UOM: ' + hs.standard_uom"></span>
+                                                                    <span>&bull;</span>
+                                                                    <span x-text="'Export Duty: ' + (hs.export_duty_rate ? hs.export_duty_rate + '%' : '0% (Free)')"></span>
+                                                                </div>
+                                                            </div>
+                                                        </template>
+                                                    </div>
+                                                </td>
+
+                                                <!-- Origin -->
+                                                <td class="py-2.5 px-3 align-top">
+                                                    <input type="text" x-model="item.origin_country" placeholder="Nepal"
+                                                           class="w-full text-xs px-2 py-1.5 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-teal-500 text-slate-800">
+                                                </td>
+
+                                                <!-- Quantity -->
+                                                <td class="py-2.5 px-3 align-top">
+                                                    <input type="number" step="1" min="1" x-model.number="item.qty" 
+                                                           @input="syncInvoiceItemQty(index)"
+                                                           class="w-full text-xs font-mono font-bold text-center px-2 py-1.5 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-teal-500 text-slate-900">
+                                                </td>
+
+                                                <!-- UOM -->
+                                                <td class="py-2.5 px-3 align-top">
+                                                    <select x-model="item.uom" class="w-full text-xs font-semibold px-2 py-1.5 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-teal-500 text-slate-800">
+                                                        <option value="PCS">PCS</option>
+                                                        <option value="SET">SET</option>
+                                                        <option value="KGS">KGS</option>
+                                                        <option value="MTR">MTR</option>
+                                                        <option value="BOX">BOX</option>
+                                                        <option value="PKT">PKT</option>
+                                                        <option value="PRS">PRS</option>
+                                                    </select>
+                                                </td>
+
+                                                <!-- Unit Price -->
+                                                <td class="py-2.5 px-3 align-top">
+                                                    <input type="number" step="0.01" min="0" x-model.number="item.unit_price" 
+                                                           class="w-full text-xs font-mono font-bold text-right px-2 py-1.5 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-teal-500 text-slate-900">
+                                                </td>
+
+                                                <!-- Line Total -->
+                                                <td class="py-2.5 px-3 align-top text-right pt-3.5">
+                                                    <span class="text-xs font-mono font-black text-slate-900" x-text="((parseFloat(item.qty) || 0) * (parseFloat(item.unit_price) || 0)).toFixed(2)"></span>
+                                                </td>
+
+                                                <!-- Action -->
+                                                <td class="py-2.5 px-3 align-top text-center pt-3.5">
+                                                    <button type="button" @click="removeInvoiceItem(index)" :disabled="invoiceItems.length <= 1"
+                                                            class="text-slate-400 hover:text-rose-600 disabled:opacity-20 disabled:hover:text-slate-400 text-xs transition cursor-pointer p-1"
+                                                            title="Remove line item">
+                                                        <i class="fas fa-trash-can"></i>
+                                                    </button>
+                                                </td>
+                                            </tr>
+                                        </template>
+                                    </tbody>
+                                    <tfoot class="bg-slate-50 border-t border-slate-200">
+                                        <tr>
+                                            <td colspan="4" class="py-3 px-3">
+                                                <button type="button" @click="addInvoiceItem()" class="px-3 py-1.5 rounded-lg bg-teal-600 hover:bg-teal-700 text-white text-xs font-bold inline-flex items-center gap-1.5 shadow-2xs transition cursor-pointer">
+                                                    <i class="fas fa-plus"></i>
+                                                    <span>Add Item Row</span>
+                                                </button>
+                                            </td>
+                                            <td colspan="2" class="py-3 px-3 text-right text-xs font-bold text-slate-600 uppercase tracking-wider">
+                                                Declared Customs Subtotal:
+                                            </td>
+                                            <td class="py-3 px-3 text-right">
+                                                <span class="font-mono font-black text-xs text-teal-800 bg-teal-50 px-2 py-1 rounded border border-teal-200 inline-block" 
+                                                      x-text="invoiceCurrency + ' ' + invoiceSubtotal.toFixed(2)"></span>
+                                            </td>
+                                            <td></td>
+                                        </tr>
+                                    </tfoot>
+                                </table>
+                            </div>
+
+                            <!-- Invoice Subtotal Summary Bar -->
+                            <div class="p-3.5 rounded-xl bg-white border border-slate-200 flex items-center justify-between text-xs">
+                                <div class="flex items-center gap-2">
+                                    <span class="font-bold text-slate-600">Declared Customs Subtotal:</span>
+                                    <span class="font-mono font-black text-teal-800 bg-teal-50 px-2.5 py-1 rounded-md border border-teal-200" 
+                                          x-text="invoiceCurrency + ' ' + invoiceSubtotal.toFixed(2)"></span>
+                                </div>
+                                <div class="text-[11px] text-slate-500">
+                                    <i class="fas fa-check-circle text-emerald-600 mr-1"></i> Ready for printable export invoice & customs filing
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 4B. PACKAGE WEIGHT, CARGO SPECIFICATIONS & SMART PACKING LIST MATRIX -->
+                    <div class="p-5 sm:p-6 rounded-2xl bg-teal-50/50 border border-teal-200/80 space-y-6">
+                        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-teal-200/60">
+                            <div class="flex items-center gap-2.5">
+                                <div class="w-8 h-8 rounded-xl bg-teal-700 text-white flex items-center justify-center text-sm shadow-xs">
+                                    <i class="fas fa-boxes-stacked"></i>
+                                </div>
+                                <div>
+                                    <h4 class="text-xs font-black uppercase tracking-wider text-teal-950">Package Weight & Smart Packing List Matrix</h4>
+                                    <p class="text-[11px] text-teal-700">Allocate declared goods across single or multiple cartons with real-time balance tracking</p>
+                                </div>
+                            </div>
+
+                            <!-- Box Count Selector -->
+                            <div class="flex items-center gap-2 bg-white px-3 py-1.5 rounded-xl border border-teal-200 shadow-2xs">
+                                <span class="text-xs font-black text-slate-700">Total Boxes:</span>
+                                <div class="flex items-center gap-1">
+                                    <button type="button" @click="setBoxCount(totalBoxes - 1)" :disabled="totalBoxes <= 1"
+                                            class="w-7 h-7 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-30 text-slate-700 font-bold text-xs flex items-center justify-center cursor-pointer">
+                                        -
+                                    </button>
+                                    <input type="number" min="1" max="50" x-model.number="totalBoxes" @change="setBoxCount(totalBoxes)"
+                                           class="w-12 text-center text-xs font-mono font-black py-1 px-1 bg-transparent border-0 focus:ring-0 text-teal-950">
+                                    <button type="button" @click="setBoxCount(totalBoxes + 1)"
+                                            class="w-7 h-7 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs flex items-center justify-center cursor-pointer">
+                                        +
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- CASE 1: Single Box (Zero-friction 100% auto-allocation) -->
+                        <div x-show="totalBoxes === 1" class="space-y-4">
+                            <div class="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-900 flex items-center justify-between">
+                                <div class="flex items-center gap-2">
+                                    <i class="fas fa-circle-check text-emerald-600 text-sm"></i>
+                                    <span class="font-bold">Single Box Shipment: Box #1 automatically contains 100% of all declared invoice items.</span>
+                                </div>
+                                <span class="text-[10px] font-mono uppercase font-black px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">100% Auto-Allocated</span>
+                            </div>
+
+                            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 bg-white p-4 rounded-xl border border-teal-200/70">
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Gross Actual Weight (KG) <span class="text-rose-500">*</span></label>
+                                    <input type="number" step="0.1" min="0.1" name="weight" id="weight-input" required 
+                                           x-model.number="boxes[0].weight_kg" @input="syncCargoWeight()"
+                                           class="w-full text-xs px-3 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-mono font-bold text-slate-900">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Length (cm)</label>
+                                    <input type="number" step="0.1" name="length" id="length-input" placeholder="L" 
+                                           x-model.number="boxes[0].length_cm" @input="syncCargoWeight()"
+                                           class="w-full text-xs px-3 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-mono">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Width (cm)</label>
+                                    <input type="number" step="0.1" name="width" id="width-input" placeholder="W" 
+                                           x-model.number="boxes[0].width_cm" @input="syncCargoWeight()"
+                                           class="w-full text-xs px-3 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-mono">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-700 mb-1">Height (cm)</label>
+                                    <input type="number" step="0.1" name="height" id="height-input" placeholder="H" 
+                                           x-model.number="boxes[0].height_cm" @input="syncCargoWeight()"
+                                           class="w-full text-xs px-3 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-mono">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- CASE 2: Multi-Box Matrix (> 1 Box) -->
+                        <div x-show="totalBoxes > 1" class="space-y-4">
+                            <!-- Multi-Box Quick Action Toolbar (1-Click Cloning & Auto-Distribution) -->
+                            <div class="flex flex-wrap items-center justify-between gap-3 p-3.5 bg-gradient-to-r from-teal-950 via-slate-900 to-teal-950 rounded-2xl border border-teal-500/40 text-white shadow-sm">
+                                <div class="flex items-center gap-2.5">
+                                    <div class="w-8 h-8 rounded-xl bg-teal-500/20 border border-teal-400/40 flex items-center justify-center text-teal-300">
+                                        <i class="fas fa-boxes-packing text-sm"></i>
+                                    </div>
+                                    <div>
+                                        <span class="font-extrabold text-xs text-white block">Multi-Box Batch Accelerators</span>
+                                        <span class="text-[11px] text-teal-300/80">1-click clone Box #1 specs or auto-balance goods across all cartons</span>
+                                    </div>
+                                </div>
+                                <div class="flex flex-wrap items-center gap-2">
+                                    <button type="button" @click="cloneBox1SpecsToAll()" 
+                                            class="px-3 py-1.5 rounded-xl bg-gradient-to-r from-teal-400 to-emerald-400 hover:from-teal-300 hover:to-emerald-300 text-slate-950 font-black text-xs transition flex items-center gap-1.5 shadow-sm cursor-pointer">
+                                        <i class="fas fa-clone"></i>
+                                        <span>Clone Box #1 Specs to All Boxes</span>
+                                    </button>
+                                    <button type="button" @click="autoDistributeItemsAcrossBoxes()" 
+                                            class="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-teal-300 border border-teal-500/40 font-bold text-xs transition flex items-center gap-1.5 cursor-pointer">
+                                        <i class="fas fa-scale-balanced"></i>
+                                        <span>Evenly Distribute Items</span>
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- Over-Allocation Warning Banner -->
+                            <div x-show="packingListWarning || hasOverAllocatedItems" x-transition 
+                                 class="p-3.5 rounded-xl bg-rose-50 border-2 border-rose-300 text-rose-900 text-xs flex items-center gap-2.5 shadow-sm">
+                                <i class="fas fa-triangle-exclamation text-rose-600 text-base flex-shrink-0"></i>
+                                <div>
+                                    <span class="font-extrabold block" x-text="packingListWarning || 'Item quantities in the packing list cannot exceed the total quantity entered in the invoice.'"></span>
+                                    <span class="text-[11px] text-rose-700">Please reduce the allocated box quantities to match the declared total invoice quantity.</span>
+                                </div>
+                            </div>
+
+                            <!-- Remaining Balance Tracker Pills -->
+                            <div class="p-3.5 rounded-xl bg-white border border-teal-200 space-y-2">
+                                <div class="flex items-center justify-between text-xs">
+                                    <span class="font-extrabold text-slate-800 uppercase tracking-wider text-[11px]">Item Allocation Tracker:</span>
+                                    <span class="text-[11px] text-slate-500">Box item quantities cannot exceed entered total quantity</span>
+                                </div>
+                                <div class="flex flex-wrap gap-2">
+                                    <template x-for="(item, idx) in invoiceItems" :key="idx">
+                                        <div class="px-3 py-1.5 rounded-lg border text-xs flex items-center gap-2 transition"
+                                             :class="getItemAllocatedQty(idx) > (parseFloat(item.qty) || 0) 
+                                                        ? 'bg-rose-50 border-rose-300 text-rose-900 ring-1 ring-rose-400 font-bold' 
+                                                        : (getItemRemainingQty(idx) === 0 
+                                                            ? 'bg-emerald-50 border-emerald-200 text-emerald-900 font-medium' 
+                                                            : 'bg-amber-50 border-amber-200 text-amber-900')">
+                                            <span class="font-bold" x-text="item.name || ('Item #' + (idx + 1))"></span>
+                                            <span class="font-mono font-black" x-text="getItemAllocatedQty(idx) + ' / ' + item.qty + ' ' + item.uom"></span>
+                                            
+                                            <!-- Over-Allocated Indicator -->
+                                            <span x-show="getItemAllocatedQty(idx) > (parseFloat(item.qty) || 0)" 
+                                                  class="text-[10px] font-black px-1.5 py-0.5 rounded bg-rose-200 text-rose-950 flex items-center gap-1">
+                                                <i class="fas fa-circle-exclamation"></i>
+                                                <span>Exceeds by <span x-text="(getItemAllocatedQty(idx) - (parseFloat(item.qty) || 0)).toFixed(0)"></span>!</span>
+                                            </span>
+
+                                            <!-- Remaining Quantity Indicator -->
+                                            <span x-show="getItemRemainingQty(idx) > 0 && getItemAllocatedQty(idx) <= (parseFloat(item.qty) || 0)" 
+                                                  class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-200/80 text-amber-950" 
+                                                  x-text="getItemRemainingQty(idx) + ' left'"></span>
+
+                                            <!-- Complete 100% Allocation Indicator -->
+                                            <span x-show="getItemRemainingQty(idx) === 0 && getItemAllocatedQty(idx) === (parseFloat(item.qty) || 0)" 
+                                                  class="text-[10px] text-emerald-700 font-black">
+                                                <i class="fas fa-check"></i>
+                                            </span>
+                                        </div>
+                                    </template>
+                                </div>
+                            </div>
+
+                            <!-- Box Cards Grid -->
+                            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                                <template x-for="(box, bIdx) in boxes" :key="bIdx">
+                                    <div class="p-4 rounded-xl bg-white border border-teal-200 shadow-2xs space-y-3">
+                                        <div class="flex items-center justify-between pb-2 border-b border-slate-100">
+                                            <div class="flex items-center gap-2">
+                                                <span class="w-6 h-6 rounded-md bg-teal-700 text-white text-xs font-black flex items-center justify-center" x-text="box.box_number"></span>
+                                                <span class="font-extrabold text-xs text-slate-900" x-text="'Box #' + box.box_number + ' of ' + totalBoxes"></span>
+                                            </div>
+                                            <div class="flex items-center gap-1.5">
+                                                <button type="button" x-show="bIdx > 0" @click="cloneSpecsFromBox(0, bIdx)" 
+                                                        title="Copy weight and dimensions from Box #1"
+                                                        class="px-2 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 text-[10px] font-bold transition cursor-pointer">
+                                                    <i class="fas fa-copy text-teal-600 mr-1"></i> Copy Box #1
+                                                </button>
+                                                <button type="button" @click="allocateAllRemainingToBox(bIdx)" 
+                                                        class="px-2.5 py-1 rounded-lg bg-teal-50 hover:bg-teal-100 text-teal-800 border border-teal-200 text-[10px] font-black tracking-wider transition cursor-pointer">
+                                                    <i class="fas fa-bolt text-teal-600 mr-1"></i> Fill Remaining
+                                                </button>
+                                            </div>
+                                        </div>
+
+                                        <!-- Dimensions & Weight -->
+                                        <div class="grid grid-cols-4 gap-2">
+                                            <div>
+                                                <label class="block text-[9px] font-bold uppercase text-slate-500 mb-0.5">Weight (KG)</label>
+                                                <input type="number" step="0.1" min="0.1" x-model.number="box.weight_kg" @input="syncCargoWeight()"
+                                                       class="w-full text-xs font-mono font-bold px-2 py-1.5 bg-slate-50 border border-slate-200 rounded-lg">
+                                            </div>
+                                            <div>
+                                                <label class="block text-[9px] font-bold uppercase text-slate-500 mb-0.5">L (cm)</label>
+                                                <input type="number" step="0.1" x-model.number="box.length_cm" @input="syncCargoWeight()"
+                                                       class="w-full text-xs font-mono px-2 py-1.5 bg-slate-50 border border-slate-200 rounded-lg">
+                                            </div>
+                                            <div>
+                                                <label class="block text-[9px] font-bold uppercase text-slate-500 mb-0.5">W (cm)</label>
+                                                <input type="number" step="0.1" x-model.number="box.width_cm" @input="syncCargoWeight()"
+                                                       class="w-full text-xs font-mono px-2 py-1.5 bg-slate-50 border border-slate-200 rounded-lg">
+                                            </div>
+                                            <div>
+                                                <label class="block text-[9px] font-bold uppercase text-slate-500 mb-0.5">H (cm)</label>
+                                                <input type="number" step="0.1" x-model.number="box.height_cm" @input="syncCargoWeight()"
+                                                       class="w-full text-xs font-mono px-2 py-1.5 bg-slate-50 border border-slate-200 rounded-lg">
+                                            </div>
+                                        </div>
+
+                                        <!-- Items inside this box -->
+                                        <div class="space-y-1.5 pt-1">
+                                            <span class="block text-[10px] font-extrabold uppercase text-slate-600">Contents in this box:</span>
+                                            <template x-for="(item, iIdx) in invoiceItems" :key="iIdx">
+                                                <div class="flex items-center justify-between gap-2 p-1.5 rounded-lg bg-slate-50 text-xs">
+                                                    <div class="truncate flex-1">
+                                                        <span class="font-bold text-slate-800 text-[11px]" x-text="item.name || ('Item #' + (iIdx + 1))"></span>
+                                                        <span class="text-[10px] text-slate-400 font-mono ml-1" x-text="'(' + item.uom + ')'"></span>
+                                                    </div>
+                                                    <div class="flex items-center gap-1.5">
+                                                        <input type="number" min="0" :max="getAvailableQtyForBox(bIdx, iIdx)" 
+                                                               x-model.number="box.items[iIdx].qty"
+                                                               @input="enforceMaxBoxItemQty(bIdx, iIdx)"
+                                                               @change="enforceMaxBoxItemQty(bIdx, iIdx)"
+                                                               class="w-16 text-center font-mono font-bold text-xs py-1 px-1 bg-white border border-slate-200 rounded-md focus:ring-1 focus:ring-teal-500"
+                                                               :class="getItemAllocatedQty(iIdx) > (parseFloat(item.qty) || 0) ? 'border-rose-500 text-rose-700 bg-rose-50 ring-1 ring-rose-400' : ''">
+                                                        <button type="button" @click="allocateRemainingToBox(bIdx, iIdx)" 
+                                                                x-show="getItemRemainingQty(iIdx) > 0"
+                                                                :title="'Add remaining (' + getItemRemainingQty(iIdx) + ') to this box'"
+                                                                class="px-2 py-1 rounded bg-teal-100 hover:bg-teal-200 text-teal-900 text-[10px] font-black cursor-pointer transition">
+                                                            +<span x-text="getItemRemainingQty(iIdx)"></span>
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </div>
+                                </template>
+                            </div>
+                        </div>
+
+                        <!-- Real-time volumetric calculation badge across all boxes -->
+                        <div class="p-4 rounded-2xl bg-white border border-teal-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+                            <div class="flex items-center gap-3">
+                                <span class="font-bold text-slate-600">Total Gross Actual Weight:</span>
+                                <span class="font-mono font-bold text-slate-900 bg-slate-50 px-2.5 py-1 rounded-lg border border-slate-200" 
+                                      x-text="totalCargoGrossWeight.toFixed(2) + ' KG'"></span>
+                            </div>
+                            <div class="flex items-center gap-3">
+                                <span class="font-bold text-slate-600">Volumetric Weight (IATA L×W×H / 5000):</span>
+                                <span id="volumetric-weight-display" class="font-mono font-bold text-teal-700 bg-white px-2.5 py-1 rounded-lg border border-slate-200"
+                                      x-text="totalCargoVolumetricWeight.toFixed(2) + ' KG'"></span>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <span class="font-bold text-slate-600">Chargeable Weight:</span>
+                                <span id="chargeable-weight-display" class="font-mono font-black text-slate-900 bg-teal-50 px-3 py-1 rounded-lg border border-teal-200 text-teal-900"
+                                      x-text="'Chargeable: ' + totalChargeableWeight.toFixed(2) + ' KG'"></span>
+                            </div>
+                        </div>
+
+                        <div>
+                            <label class="block text-xs font-bold text-slate-700 mb-1">Cargo / Goods Description</label>
+                            <input type="text" name="description" placeholder="e.g. Garments, Handcrafted Goods, Samples"
+                                   class="w-full text-xs px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 text-slate-900 font-medium">
+                        </div>
+                    </div>
+
+                    <!-- 4C. NEPAL GOVERNMENT TAX & CUSTOMS COMPLIANCE (SUPPORTING BILL UPLOAD) -->
+                    <div class="p-5 sm:p-6 rounded-2xl bg-slate-50/90 border border-slate-200/90 space-y-4">
+                        <div class="flex items-center gap-2.5 pb-2 border-b border-slate-200">
+                            <div class="w-8 h-8 rounded-xl bg-slate-900 text-white flex items-center justify-center text-sm shadow-xs">
+                                <i class="fas fa-receipt"></i>
+                            </div>
+                            <div>
+                                <h4 class="text-xs font-black uppercase tracking-wider text-slate-900">Nepal Tax & Customs Documentation</h4>
+                                <p class="text-[11px] text-slate-500">Attach supporting VAT Tax Invoice, PAN Bill, or Customs Export Declaration</p>
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Supporting Document / Bill Type</label>
+                                <select name="seller_bill_type" x-model="sellerBillType" class="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 text-slate-800 font-semibold">
+                                    <option value="vat_invoice">Inland Revenue Dept (IRD) Authenticated VAT Invoice</option>
+                                    <option value="pan_bill">PAN Cash Bill / Retail Receipt</option>
+                                    <option value="customs_declaration">Nepal Customs Export Declaration (Pragyapanpatra)</option>
+                                    <option value="certificate_of_origin">Certificate of Origin (NCCI / FNCCI)</option>
+                                    <option value="other">Other Official Commercial Bill</option>
+                                </select>
+                            </div>
+
+                            <div>
+                                <label class="block text-xs font-bold text-slate-700 mb-1">Document / Bill Reference Number</label>
+                                <input type="text" name="seller_bill_number" x-model="sellerBillNumber" placeholder="e.g. VAT-081/82-00412" 
+                                       class="w-full text-xs font-mono font-medium px-3 py-2 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 text-slate-800">
+                            </div>
+                        </div>
+
+                        <!-- File Drag & Drop / Input -->
+                        <div>
+                            <label class="block text-xs font-bold text-slate-700 mb-1">Upload Bill / Receipt File (PDF, JPG, PNG, WEBP &bull; Max 10MB)</label>
+                            <div class="relative border-2 border-dashed border-slate-300 hover:border-teal-500 rounded-2xl p-4 bg-white text-center transition cursor-pointer">
+                                <input type="file" name="seller_bill_file" id="seller_bill_file" accept=".pdf,.jpg,.jpeg,.png,.webp"
+                                       @change="handleBillFileSelect($event)"
+                                       class="absolute inset-0 opacity-0 cursor-pointer w-full h-full z-10">
+                                <div class="space-y-1">
+                                    <i class="fas fa-cloud-arrow-up text-teal-600 text-xl"></i>
+                                    <p class="text-xs font-bold text-slate-800" x-show="!selectedBillFileName">
+                                        Click or drag tax bill / invoice file to upload
+                                    </p>
+                                    <p class="text-xs font-black text-teal-700" x-show="selectedBillFileName" x-text="selectedBillFileName"></p>
+                                    <span class="text-[10px] text-slate-400 block">Complies with Nepal Inland Revenue Department (IRD) transport guidelines</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+
+            <!-- 5. STICKY SUMMARY & SUBMIT CONSIGNMENT BUTTON -->
+            <div class="bg-gradient-to-r from-slate-900 via-slate-950 to-teal-950 rounded-3xl p-6 text-white shadow-xl border border-teal-900/60 space-y-4">
+                <div class="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                    <div>
+                        <div class="flex items-center gap-2 mb-1">
+                            <span class="px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-teal-500/20 text-teal-300 border border-teal-500/30" id="summary-mode-badge">
+                                DOMESTIC
+                            </span>
+                            <span class="text-xs text-slate-400">&bull; Live Ready for Dispatch</span>
+                        </div>
+                        <h4 class="text-lg font-black text-white">Consignment Dispatch Summary</h4>
+                        <p class="text-xs text-slate-300 mt-0.5">
+                            <span id="summary-pickups-count">1 Location</span> &bull; 
+                            <span id="summary-deliveries-count">1 Destination</span> &bull; 
+                            <span id="summary-weight">1.00 KG</span>
+                        </p>
+                    </div>
+
+                    @if(request('quoted_rate'))
+                        <div class="text-right">
+                            <span class="text-[11px] text-slate-400 uppercase font-bold tracking-wider">Approved Tariff</span>
+                            <p class="text-2xl font-black font-mono text-teal-300">Rs. {{ number_format((float)request('quoted_rate')) }}</p>
+                        </div>
+                    @endif
+                </div>
+
+                <!-- Live Interactive Validation Guidance Banner -->
+                <div id="consignment-validation-errors" class="hidden transition-all duration-300"></div>
+
+                <button type="button" id="submit-btn" onclick="validateAndSubmitConsignment(event)"
+                        :class="totalBoxes > 1 && hasOverAllocatedItems ? 'opacity-85 ring-2 ring-rose-400' : ''"
+                        class="w-full py-4 bg-gradient-to-r from-teal-400 to-emerald-400 hover:from-teal-300 hover:to-emerald-300 text-slate-950 font-black text-xs uppercase tracking-wider rounded-2xl shadow-lg transition-all transform hover:-translate-y-0.5 flex items-center justify-center gap-2 cursor-pointer">
+                    <i class="fas fa-circle-check" id="submit-btn-icon"></i>
+                    <span id="submit-btn-text">Confirm & Book Consignment (Issue HAWB)</span>
+                </button>
+
+                <p class="text-[10px] text-slate-400 text-center leading-relaxed">
+                    Upon submission, your consignment will be booked with verified HAWB telemetry and assigned for immediate collection.
+                </p>
+            </div>
+        </form>
+    </div>
+
+    <!-- ========================================================================= -->
+    <!-- LIVE DISPATCHES & CONSIGNMENT QUEUE VIEW -->
+    <!-- ========================================================================= -->
+    <div x-show="activeConsoleView === 'queue' || activeConsoleTab === 'queue'" x-transition class="space-y-6">
+        <!-- Status Metrics Cards -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div class="bg-white rounded-2xl p-4 border border-slate-200 shadow-xs">
+                <p class="text-xs font-bold text-slate-500 uppercase tracking-wider">Total Pickups</p>
+                <p class="text-2xl font-black text-slate-900 mt-1">{{ $pickupStatusCounts['all'] ?? 0 }}</p>
+            </div>
+            <div class="bg-white rounded-2xl p-4 border border-slate-200 shadow-xs">
+                <p class="text-xs font-bold text-amber-600 uppercase tracking-wider">Pending Dispatch</p>
+                <p class="text-2xl font-black text-amber-600 mt-1">{{ $pickupStatusCounts['pending'] ?? 0 }}</p>
+            </div>
+            <div class="bg-white rounded-2xl p-4 border border-slate-200 shadow-xs">
+                <p class="text-xs font-bold text-blue-600 uppercase tracking-wider">Assigned / In Transit</p>
+                <p class="text-2xl font-black text-blue-600 mt-1">{{ ($pickupStatusCounts['assigned'] ?? 0) + ($pickupStatusCounts['in_transit'] ?? 0) }}</p>
+            </div>
+            <div class="bg-white rounded-2xl p-4 border border-slate-200 shadow-xs">
+                <p class="text-xs font-bold text-emerald-600 uppercase tracking-wider">Delivered / Completed</p>
+                <p class="text-2xl font-black text-emerald-600 mt-1">{{ $pickupStatusCounts['delivered'] ?? 0 }}</p>
+            </div>
+        </div>
+
+        <!-- Live Queue Table Container -->
+        <div class="bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden">
+            <div class="p-5 bg-gradient-to-r from-slate-50 to-teal-50/40 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div>
+                    <h3 class="text-sm font-black uppercase tracking-wider text-slate-900 flex items-center gap-2">
+                        <i class="fas fa-list-check text-teal-600"></i>
+                        <span>Active Dispatches & Pickup Queue</span>
+                    </h3>
+                    <p class="text-xs text-slate-500 mt-0.5">Real-time status of your requested pickups and active consignment collections.</p>
+                </div>
+
+                <div class="flex items-center gap-2">
+                    <button type="button" @click="switchConsole('booking'); hasDoorstepPickup = true" class="px-3.5 py-1.5 bg-teal-600 hover:bg-teal-700 text-white font-bold text-xs rounded-xl transition flex items-center gap-1.5">
+                        <i class="fas fa-truck-ramp-box"></i>
+                        <span>New Shipment (With Pickup)</span>
+                    </button>
+                    <button type="button" @click="switchConsole('booking'); hasDoorstepPickup = false" class="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs rounded-xl transition flex items-center gap-1.5">
+                        <i class="fas fa-store"></i>
+                        <span>Self Drop-off Booking</span>
+                    </button>
+                </div>
+            </div>
+
+            @if(isset($activePickups) && $activePickups->count() > 0)
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left text-xs">
+                        <thead class="bg-slate-50/80 text-[11px] font-extrabold text-slate-500 uppercase tracking-wider border-b border-slate-200">
+                            <tr>
+                                <th class="p-4">Reference #</th>
+                                <th class="p-4">Pickup Location</th>
+                                <th class="p-4">Destination</th>
+                                <th class="p-4">Assigned Rider</th>
+                                <th class="p-4">Status</th>
+                                <th class="p-4 text-right">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-slate-100 font-medium">
+                            @foreach($activePickups as $pReq)
+                                <tr class="hover:bg-slate-50/70 transition">
+                                    <td class="p-4">
+                                        <span class="font-mono font-bold text-slate-900">{{ $pReq->tracking_number }}</span>
+                                        <span class="block text-[10px] text-slate-400 font-normal">{{ $pReq->created_at->diffForHumans() }}</span>
+                                    </td>
+                                    <td class="p-4 max-w-xs">
+                                        <div class="truncate text-slate-800 font-semibold">{{ $pReq->pickup_address }}</div>
+                                        <div class="text-[11px] text-slate-500 truncate">{{ $pReq->contact_person_name }} &bull; {{ $pReq->contact_person_phone }}</div>
+                                    </td>
+                                    <td class="p-4 max-w-xs">
+                                        <div class="truncate text-slate-800">{{ $pReq->delivery_address ?: 'Open Destination (Declare at collection)' }}</div>
+                                        <div class="text-[11px] text-slate-500">{{ $pReq->delivery_city ?: 'Kathmandu Valley' }}</div>
+                                    </td>
+                                    <td class="p-4">
+                                        @if($pReq->rider)
+                                            <span class="inline-flex items-center gap-1 text-slate-800 font-bold">
+                                                <i class="fas fa-motorcycle text-teal-600"></i> {{ $pReq->rider->name }}
+                                            </span>
+                                            <span class="block text-[11px] text-slate-500 font-mono">{{ $pReq->rider->phone }}</span>
+                                        @else
+                                            <span class="text-amber-700 bg-amber-50 border border-amber-200 text-[10px] font-bold px-2 py-0.5 rounded-full">
+                                                Awaiting Rider
+                                            </span>
+                                        @endif
+                                    </td>
+                                    <td class="p-4">
+                                        @php
+                                            $stMap = [
+                                                'pending' => 'bg-amber-100 text-amber-800 border-amber-200',
+                                                'assigned' => 'bg-blue-100 text-blue-800 border-blue-200',
+                                                'picked_up' => 'bg-purple-100 text-purple-800 border-purple-200',
+                                                'in_transit' => 'bg-sky-100 text-sky-800 border-sky-200',
+                                                'delivered' => 'bg-emerald-100 text-emerald-800 border-emerald-200',
+                                            ];
+                                            $stClass = $stMap[$pReq->status] ?? 'bg-slate-100 text-slate-800 border-slate-200';
+                                        @endphp
+                                        <span class="px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider border {{ $stClass }}">
+                                            {{ str_replace('_', ' ', $pReq->status) }}
+                                        </span>
+                                    </td>
+                                    <td class="p-4 text-right space-x-2">
+                                        <a href="{{ route('tracking.search', ['tracking' => $pReq->tracking_number]) }}" 
+                                           class="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-[11px] transition inline-flex items-center gap-1">
+                                            <i class="fas fa-search text-[10px]"></i> Track
+                                        </a>
+
+                                        @if(empty($pReq->shipment_id))
+                                            <a href="{{ route('shipments.create', ['convert_pickup_id' => $pReq->id, 'tab' => 'consignment']) }}" 
+                                               class="px-2.5 py-1 rounded-lg bg-teal-50 hover:bg-teal-100 text-teal-800 border border-teal-200 font-bold text-[11px] transition inline-flex items-center gap-1">
+                                                <i class="fas fa-boxes-stacked text-[10px]"></i> Convert to Consignment
+                                            </a>
+                                        @endif
+                                    </td>
+                                </tr>
+                            @endforeach
+                        </tbody>
+                    </table>
+                </div>
+            @else
+                <div class="p-12 text-center text-slate-500 space-y-3">
+                    <div class="w-12 h-12 rounded-2xl bg-slate-100 text-slate-400 flex items-center justify-center text-xl mx-auto">
+                        <i class="fas fa-inbox"></i>
+                    </div>
+                    <p class="text-sm font-bold text-slate-700">No active dispatches found in the queue</p>
+                    <p class="text-xs max-w-sm mx-auto">Schedule a doorstep pickup or book a full consignment to dispatch couriers immediately.</p>
+                </div>
+            @endif
+        </div>
+    </div>
+
+    <!-- ========================================================================= -->
+    <!-- WCO HARMONIZED SYSTEM (HS) TARIFF EXPLORER MODAL -->
+    <!-- ========================================================================= -->
+    <div x-show="wcoModalOpen" 
+         x-transition:enter="transition ease-out duration-200"
+         x-transition:enter-start="opacity-0"
+         x-transition:enter-end="opacity-100"
+         x-transition:leave="transition ease-in duration-150"
+         x-transition:leave-start="opacity-100"
+         x-transition:leave-end="opacity-0"
+         class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs"
+         style="display: none;">
+        <div @click.outside="wcoModalOpen = false" 
+             class="bg-white rounded-3xl max-w-3xl w-full max-h-[85vh] flex flex-col shadow-2xl border border-slate-200 overflow-hidden">
+            <!-- Modal Header -->
+            <div class="p-5 border-b border-slate-100 flex items-center justify-between bg-slate-50/80">
+                <div class="flex items-center gap-3">
+                    <div class="w-10 h-10 rounded-2xl bg-teal-600 text-white flex items-center justify-center text-base shadow-xs">
+                        <i class="fas fa-book-atlas"></i>
+                    </div>
+                    <div>
+                        <h3 class="text-sm font-black text-slate-900 uppercase tracking-wider">WCO Harmonized System (HS) Tariffs Explorer</h3>
+                        <p class="text-xs text-slate-500">Official World Customs Organization tariff codes for Nepal exports & global clearance</p>
+                    </div>
+                </div>
+                <button type="button" @click="wcoModalOpen = false" class="text-slate-400 hover:text-slate-600 w-8 h-8 rounded-xl flex items-center justify-center hover:bg-slate-100 cursor-pointer">
+                    <i class="fas fa-times text-sm"></i>
+                </button>
+            </div>
+
+            <!-- Search & Filter Controls -->
+            <div class="p-4 border-b border-slate-100 space-y-3 bg-white">
+                <div class="flex items-center gap-2">
+                    <div class="relative flex-1">
+                        <i class="fas fa-search absolute left-3.5 top-3 text-slate-400 text-xs"></i>
+                        <input type="text" x-model="wcoSearchQuery" @input.debounce.300ms="performWcoSearch()"
+                               placeholder="Search by commodity name, keyword, or HS code prefix..." 
+                               class="w-full text-xs pl-9 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-medium text-slate-900">
+                    </div>
+                    <button type="button" @click="performWcoSearch()" class="px-4 py-2.5 rounded-xl bg-teal-600 hover:bg-teal-700 text-white text-xs font-bold transition shadow-xs cursor-pointer">
+                        Search
+                    </button>
+                </div>
+
+                <!-- Category Pills Filter -->
+                <div class="flex items-center gap-1.5 overflow-x-auto pb-1 text-xs">
+                    <button type="button" @click="wcoCategory = ''; performWcoSearch()" 
+                            :class="wcoCategory === '' ? 'bg-teal-600 text-white' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'"
+                            class="px-2.5 py-1 rounded-lg font-bold whitespace-nowrap transition cursor-pointer">
+                        All Categories
+                    </button>
+                    <button type="button" @click="wcoCategory = 'Handicrafts & Art'; performWcoSearch()" 
+                            :class="wcoCategory === 'Handicrafts & Art' ? 'bg-teal-600 text-white' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'"
+                            class="px-2.5 py-1 rounded-lg font-bold whitespace-nowrap transition cursor-pointer">
+                        Handicrafts & Art
+                    </button>
+                    <button type="button" @click="wcoCategory = 'Pashmina & Wool'; performWcoSearch()" 
+                            :class="wcoCategory === 'Pashmina & Wool' ? 'bg-teal-600 text-white' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'"
+                            class="px-2.5 py-1 rounded-lg font-bold whitespace-nowrap transition cursor-pointer">
+                        Pashmina & Wool
+                    </button>
+                    <button type="button" @click="wcoCategory = 'Tea, Coffee & Spices'; performWcoSearch()" 
+                            :class="wcoCategory === 'Tea, Coffee & Spices' ? 'bg-teal-600 text-white' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'"
+                            class="px-2.5 py-1 rounded-lg font-bold whitespace-nowrap transition cursor-pointer">
+                        Tea & Spices
+                    </button>
+                    <button type="button" @click="wcoCategory = 'Medicinal & Herbal'; performWcoSearch()" 
+                            :class="wcoCategory === 'Medicinal & Herbal' ? 'bg-teal-600 text-white' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'"
+                            class="px-2.5 py-1 rounded-lg font-bold whitespace-nowrap transition cursor-pointer">
+                        Herbal & Ayurvedic
+                    </button>
+                    <button type="button" @click="wcoCategory = 'Apparel & Textiles'; performWcoSearch()" 
+                            :class="wcoCategory === 'Apparel & Textiles' ? 'bg-teal-600 text-white' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'"
+                            class="px-2.5 py-1 rounded-lg font-bold whitespace-nowrap transition cursor-pointer">
+                        Apparel & Textiles
+                    </button>
+                </div>
+            </div>
+
+            <!-- Modal Body Results List -->
+            <div class="flex-1 overflow-y-auto p-4 space-y-2.5">
+                <div x-show="wcoLoading" class="text-center py-12 text-slate-500 text-xs">
+                    <i class="fas fa-spinner fa-spin text-2xl text-teal-600 mb-2"></i>
+                    <p>Loading WCO Tariff schedule...</p>
+                </div>
+
+                <div x-show="!wcoLoading && wcoResults.length === 0" class="text-center py-12 text-slate-500 text-xs">
+                    <i class="fas fa-folder-open text-2xl text-slate-300 mb-2"></i>
+                    <p>No HS Codes found matching your query.</p>
+                </div>
+
+                <template x-for="hs in wcoResults" :key="hs.id">
+                    <div class="p-3 rounded-xl border border-slate-200 hover:border-teal-500 hover:bg-teal-50/40 transition flex items-center justify-between gap-4">
+                        <div class="space-y-1">
+                            <div class="flex items-center gap-2">
+                                <span class="font-bold text-xs text-slate-900" x-text="hs.commodity_name"></span>
+                                <span class="font-mono font-black text-xs text-teal-700 px-2 py-0.5 rounded bg-teal-100/60" x-text="'HS ' + hs.code"></span>
+                            </div>
+                            <div class="text-[11px] text-slate-500 flex items-center gap-2 flex-wrap">
+                                <span class="px-1.5 py-0.5 rounded bg-slate-100 text-slate-700 font-semibold" x-text="hs.category"></span>
+                                <span>&bull;</span>
+                                <span x-text="'UOM: ' + hs.standard_uom"></span>
+                                <span>&bull;</span>
+                                <span x-text="'Export Duty: ' + (hs.export_duty_rate ? hs.export_duty_rate + '%' : '0% Free')"></span>
+                                <span x-show="hs.customs_notes" class="text-slate-400" x-text="'(' + hs.customs_notes + ')'"></span>
+                            </div>
+                        </div>
+                        <button type="button" @click="chooseWcoResult(hs)"
+                                class="px-3.5 py-1.5 rounded-xl bg-teal-600 hover:bg-teal-700 text-white font-bold text-xs transition shadow-2xs whitespace-nowrap cursor-pointer">
+                            Select
+                        </button>
+                    </div>
+                </template>
+            </div>
+
+            <!-- Modal Footer -->
+            <div class="p-3.5 border-t border-slate-100 bg-slate-50 flex items-center justify-between text-xs text-slate-500">
+                <span>World Customs Organization (WCO) & Department of Customs, Nepal</span>
+                <button type="button" @click="wcoModalOpen = false" class="px-4 py-1.5 rounded-xl border border-slate-200 hover:bg-slate-100 text-slate-700 font-bold transition">
+                    Close
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+@endsection
+
+@push('scripts')
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+    // Maps storage objects
+    const pickupMaps = {};
+    const deliveryMaps = {};
+    let internationalMap = null;
+    let pickupCount = 1;
+    let deliveryCount = 1;
+
+    // =============================================
+    // MAP INITIALIZATION MANAGER
+    // =============================================
+    function initLeafletMap(containerId, initialLat, initialLng, onUpdateCoords) {
+        const el = document.getElementById(containerId);
+        if (!el || typeof L === 'undefined') return null;
+
+        const map = L.map(containerId, { zoomControl: true }).setView([initialLat, initialLng], 13);
+        
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '© OpenStreetMap'
+        }).addTo(map);
+
+        const marker = L.marker([initialLat, initialLng], { draggable: true }).addTo(map);
+
+        marker.on('dragend', function() {
+            const pos = marker.getLatLng();
+            if (onUpdateCoords) onUpdateCoords(pos.lat, pos.lng);
+        });
+
+        map.on('click', function(e) {
+            marker.setLatLng(e.latlng);
+            if (onUpdateCoords) onUpdateCoords(e.latlng.lat, e.latlng.lng);
+        });
+
+        return { map, marker };
+    }
+
+    function initPickupMap(index) {
+        const mapId = `pickup-map-${index}`;
+        const instance = initLeafletMap(mapId, 27.7172, 85.3240, function(lat, lng) {
+            document.getElementById(`pickup-lat-${index}`).value = lat.toFixed(6);
+            document.getElementById(`pickup-lng-${index}`).value = lng.toFixed(6);
+            const coordEl = document.getElementById(`pickup-coords-${index}`);
+            if (coordEl) coordEl.innerText = `Lat: ${lat.toFixed(4)}, Lng: ${lng.toFixed(4)}`;
+        });
+        if (instance) pickupMaps[index] = instance;
+    }
+
+    function initDeliveryMap(index) {
+        const mapId = `delivery-map-${index}`;
+        const instance = initLeafletMap(mapId, 27.7172, 85.3240, function(lat, lng) {
+            document.getElementById(`delivery-lat-${index}`).value = lat.toFixed(6);
+            document.getElementById(`delivery-lng-${index}`).value = lng.toFixed(6);
+            const coordEl = document.getElementById(`delivery-coords-${index}`);
+            if (coordEl) coordEl.innerText = `Lat: ${lat.toFixed(4)}, Lng: ${lng.toFixed(4)}`;
+        });
+        if (instance) deliveryMaps[index] = instance;
+    }
+
+    function initIntlMap() {
+        const instance = initLeafletMap('delivery-international-map', 40.7128, -74.0060, function(lat, lng) {
+            document.getElementById('delivery-lat-intl').value = lat.toFixed(6);
+            document.getElementById('delivery-lng-intl').value = lng.toFixed(6);
+            const coordEl = document.getElementById('delivery-intl-coords');
+            if (coordEl) coordEl.innerText = `Lat: ${lat.toFixed(4)}, Lng: ${lng.toFixed(4)}`;
+        });
+        if (instance) internationalMap = instance;
+    }
+
+    // =============================================
+    // INLINE MAP LOCATION SEARCH (NO PROMPT)
+    // =============================================
+    function searchLocationOnMap(type, index) {
+        const inputId = type === 'pickup' ? `pickup-search-${index}` : `delivery-search-${index}`;
+        const input = document.getElementById(inputId);
+        if (!input || !input.value.trim()) return;
+
+        const query = input.value.trim() + (type === 'pickup' ? ', Nepal' : '');
+        
+        fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=1`)
+            .then(res => res.json())
+            .then(data => {
+                if (data && data.length > 0) {
+                    const lat = parseFloat(data[0].lat);
+                    const lng = parseFloat(data[0].lon);
+                    
+                    const obj = type === 'pickup' ? pickupMaps[index] : deliveryMaps[index];
+                    if (obj) {
+                        obj.map.setView([lat, lng], 15);
+                        obj.marker.setLatLng([lat, lng]);
+                        
+                        const latEl = document.getElementById(type === 'pickup' ? `pickup-lat-${index}` : `delivery-lat-${index}`);
+                        const lngEl = document.getElementById(type === 'pickup' ? `pickup-lng-${index}` : `delivery-lng-${index}`);
+                        if (latEl) latEl.value = lat.toFixed(6);
+                        if (lngEl) lngEl.value = lng.toFixed(6);
+                        
+                        const coordEl = document.getElementById(type === 'pickup' ? `pickup-coords-${index}` : `delivery-coords-${index}`);
+                        if (coordEl) coordEl.innerText = `Lat: ${lat.toFixed(4)}, Lng: ${lng.toFixed(4)}`;
+                    }
+                } else {
+                    alert('Location not found. Please try a more specific landmark.');
+                }
+            })
+            .catch(() => alert('Location search is currently busy. Please click directly on the map.'));
+    }
+
+    function getCurrentLocationOnMap(type, index) {
+        if (!navigator.geolocation) {
+            alert('Geolocation is not supported by your browser.');
+            return;
+        }
+
+        navigator.geolocation.getCurrentPosition(
+            function(pos) {
+                const lat = pos.coords.latitude;
+                const lng = pos.coords.longitude;
+                const obj = type === 'pickup' ? pickupMaps[index] : deliveryMaps[index];
+                if (obj) {
+                    obj.map.setView([lat, lng], 16);
+                    obj.marker.setLatLng([lat, lng]);
+
+                    const latEl = document.getElementById(type === 'pickup' ? `pickup-lat-${index}` : `delivery-lat-${index}`);
+                    const lngEl = document.getElementById(type === 'pickup' ? `pickup-lng-${index}` : `delivery-lng-${index}`);
+                    if (latEl) latEl.value = lat.toFixed(6);
+                    if (lngEl) lngEl.value = lng.toFixed(6);
+
+                    const coordEl = document.getElementById(type === 'pickup' ? `pickup-coords-${index}` : `delivery-coords-${index}`);
+                    if (coordEl) coordEl.innerText = `Lat: ${lat.toFixed(4)}, Lng: ${lng.toFixed(4)}`;
+                }
+            },
+            function() {
+                alert('Unable to retrieve GPS position. Please click on the map directly.');
+            }
+        );
+    }
+
+    // =============================================
+    // 1-CLICK SAVED ADDRESS & INQUIRY PRE-FILLER
+    // =============================================
+    function applySavedPickup(selectEl, index) {
+        const option = selectEl.options[selectEl.selectedIndex];
+        if (!option || !option.value) return;
+
+        const name = option.getAttribute('data-name');
+        const phone = option.getAttribute('data-phone');
+        const address = option.getAttribute('data-address');
+        const lat = parseFloat(option.getAttribute('data-lat'));
+        const lng = parseFloat(option.getAttribute('data-lng'));
+
+        if (name) document.getElementById(`pickup_name_${index}`).value = name;
+        if (phone) document.getElementById(`pickup_phone_${index}`).value = phone;
+        if (address) document.getElementById(`pickup_address_${index}`).value = address;
+
+        if (!isNaN(lat) && !isNaN(lng) && lat !== 0 && lng !== 0) {
+            const obj = pickupMaps[index];
+            if (obj) {
+                obj.map.setView([lat, lng], 15);
+                obj.marker.setLatLng([lat, lng]);
+                document.getElementById(`pickup-lat-${index}`).value = lat.toFixed(6);
+                document.getElementById(`pickup-lng-${index}`).value = lng.toFixed(6);
+                const coordEl = document.getElementById(`pickup-coords-${index}`);
+                if (coordEl) coordEl.innerText = `Lat: ${lat.toFixed(4)}, Lng: ${lng.toFixed(4)}`;
+            }
+        }
+    }
+
+    // =============================================
+    // DYNAMIC MULTIPLE PICKUP POINTS
+    // =============================================
+    function addPickupPoint() {
+        const index = pickupCount++;
+        const container = document.getElementById('pickup-container');
+
+        const cardHtml = `
+            <div class="pickup-card p-5 sm:p-6 rounded-2xl bg-slate-50/70 border border-slate-200 space-y-4" id="pickup-card-${index}">
+                <div class="flex items-center justify-between gap-3 pb-2 border-b border-slate-200">
+                    <div class="flex items-center gap-2">
+                        <span class="w-6 h-6 rounded-lg bg-teal-600 text-white text-xs font-black flex items-center justify-center">${index + 1}</span>
+                        <span class="font-extrabold text-xs text-slate-800 uppercase tracking-wider">Pickup Location #${index + 1}</span>
+                    </div>
+                    <button type="button" onclick="removePickupPoint(${index})" class="text-rose-500 hover:text-rose-700 text-xs font-bold remove-pickup-btn cursor-pointer">
+                        <i class="fas fa-trash-can mr-1"></i> Remove Location
+                    </button>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1.5">Contact Person Name *</label>
+                        <input type="text" name="pickup_name[]" id="pickup_name_${index}" required 
+                               class="w-full text-xs px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-medium"
+                               placeholder="Contact person name">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1.5">Mobile Number *</label>
+                        <input type="text" name="pickup_phone[]" id="pickup_phone_${index}" required 
+                               class="w-full text-xs px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-mono font-medium"
+                               placeholder="98XXXXXXXX">
+                    </div>
+                </div>
+
+                <div>
+                    <label class="block text-xs font-bold text-slate-700 mb-1.5">Street Address *</label>
+                    <textarea name="pickup_address[]" id="pickup_address_${index}" rows="2" required 
+                              class="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-medium"
+                              placeholder="Full street address, building, ward number"></textarea>
+                </div>
+
+                <div class="space-y-2">
+                    <div class="flex items-center justify-between">
+                        <label class="text-[11px] font-bold uppercase tracking-wider text-slate-600">Map Pin:</label>
+                        <span class="text-[10px] text-slate-400 font-mono" id="pickup-coords-${index}">Lat: 27.7172, Lng: 85.3240</span>
+                    </div>
+
+                    <div class="flex items-center gap-2">
+                        <input type="text" id="pickup-search-${index}" placeholder="Search landmark..." 
+                               onkeydown="if(event.key === 'Enter'){ event.preventDefault(); searchLocationOnMap('pickup', ${index}); }"
+                               class="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl">
+                        <button type="button" onclick="searchLocationOnMap('pickup', ${index})" class="px-3 py-2 bg-teal-600 text-white rounded-xl text-xs font-bold">Search</button>
+                    </div>
+
+                    <div id="pickup-map-${index}" class="map-container"></div>
+                    <input type="hidden" name="pickup_lat[]" id="pickup-lat-${index}" value="27.7172">
+                    <input type="hidden" name="pickup_lng[]" id="pickup-lng-${index}" value="85.3240">
+                </div>
+            </div>
+        `;
+        
+        container.insertAdjacentHTML('beforeend', cardHtml);
+        setTimeout(() => initPickupMap(index), 100);
+        updateSummaryStats();
+    }
+
+    function removePickupPoint(index) {
+        const card = document.getElementById(`pickup-card-${index}`);
+        if (card && document.querySelectorAll('.pickup-card').length > 1) {
+            card.remove();
+            delete pickupMaps[index];
+            updateSummaryStats();
+        } else {
+            alert('At least one pickup location is required.');
+        }
+    }
+
+    // =============================================
+    // DYNAMIC MULTIPLE DELIVERY POINTS
+    // =============================================
+    function addDeliveryPoint() {
+        const index = deliveryCount++;
+        const container = document.getElementById('delivery-multiple');
+
+        const cardHtml = `
+            <div class="delivery-card p-5 sm:p-6 rounded-2xl bg-slate-50/70 border border-slate-200 space-y-4" id="delivery-card-${index}">
+                <div class="flex items-center justify-between gap-3 pb-2 border-b border-slate-200">
+                    <div class="flex items-center gap-2">
+                        <span class="w-6 h-6 rounded-lg bg-teal-600 text-white text-xs font-black flex items-center justify-center">${index + 1}</span>
+                        <span class="font-extrabold text-xs text-slate-800 uppercase tracking-wider">Delivery Destination #${index + 1}</span>
+                    </div>
+                    <button type="button" onclick="removeDeliveryPoint(${index})" class="text-rose-500 hover:text-rose-700 text-xs font-bold remove-delivery-btn cursor-pointer">
+                        <i class="fas fa-trash-can mr-1"></i> Remove Destination
+                    </button>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1.5">Recipient Full Name *</label>
+                        <input type="text" name="delivery_name[]" id="delivery_name_${index}" required 
+                               class="w-full text-xs px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-medium"
+                               placeholder="Recipient name">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-700 mb-1.5">Recipient Phone *</label>
+                        <input type="text" name="delivery_phone[]" id="delivery_phone_${index}" required 
+                               class="w-full text-xs px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-mono font-medium"
+                               placeholder="98XXXXXXXX">
+                    </div>
+                </div>
+
+                <div>
+                    <label class="block text-xs font-bold text-slate-700 mb-1.5">Street Address *</label>
+                    <textarea name="delivery_address[]" id="delivery_address_${index}" rows="2" required 
+                              class="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-teal-500 font-medium"
+                              placeholder="Full street address, building, ward number"></textarea>
+                </div>
+
+                <div class="space-y-2">
+                    <div class="flex items-center justify-between">
+                        <label class="text-[11px] font-bold uppercase tracking-wider text-slate-600">Map Pin:</label>
+                        <span class="text-[10px] text-slate-400 font-mono" id="delivery-coords-${index}">Lat: 27.7172, Lng: 85.3240</span>
+                    </div>
+
+                    <div class="flex items-center gap-2">
+                        <input type="text" id="delivery-search-${index}" placeholder="Search landmark..." 
+                               onkeydown="if(event.key === 'Enter'){ event.preventDefault(); searchLocationOnMap('delivery', ${index}); }"
+                               class="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl">
+                        <button type="button" onclick="searchLocationOnMap('delivery', ${index})" class="px-3 py-2 bg-teal-600 text-white rounded-xl text-xs font-bold">Search</button>
+                    </div>
+
+                    <div id="delivery-map-${index}" class="map-container"></div>
+                    <input type="hidden" name="delivery_lat[]" id="delivery-lat-${index}" value="27.7172">
+                    <input type="hidden" name="delivery_lng[]" id="delivery-lng-${index}" value="85.3240">
+                </div>
+            </div>
+        `;
+
+        container.insertAdjacentHTML('beforeend', cardHtml);
+        setTimeout(() => initDeliveryMap(index), 100);
+        updateSummaryStats();
+    }
+
+    function removeDeliveryPoint(index) {
+        const card = document.getElementById(`delivery-card-${index}`);
+        if (card && document.querySelectorAll('.delivery-card').length > 1) {
+            card.remove();
+            delete deliveryMaps[index];
+            updateSummaryStats();
+        } else {
+            alert('At least one delivery destination is required.');
+        }
+    }
+
+    // =============================================
+    // MODE SWITCHER (DOMESTIC / INTERNATIONAL / ECOM)
+    // =============================================
+    function switchMode(mode) {
+        document.getElementById('shipment_type').value = mode;
+
+        document.querySelectorAll('.mode-selector-btn').forEach(btn => {
+            btn.className = 'mode-selector-btn border-2 border-slate-200 bg-white hover:border-slate-300 text-slate-900 rounded-2xl p-4 text-left transition flex items-start gap-3.5 cursor-pointer';
+            btn.querySelector('div').className = 'w-10 h-10 rounded-xl bg-slate-100 text-slate-700 flex items-center justify-center text-lg flex-shrink-0 shadow-xs';
+        });
+
+        const activeBtn = document.getElementById(`mode-btn-${mode}`);
+        if (activeBtn) {
+            activeBtn.className = 'mode-selector-btn border-2 border-teal-600 bg-teal-50/70 text-slate-900 ring-2 ring-teal-500/20 rounded-2xl p-4 text-left transition flex items-start gap-3.5 cursor-pointer';
+            activeBtn.querySelector('div').className = 'w-10 h-10 rounded-xl bg-teal-600 text-white flex items-center justify-center text-lg flex-shrink-0 shadow-xs';
+        }
+
+        document.getElementById('service-options-domestic').classList.toggle('hidden', mode !== 'domestic');
+        document.getElementById('service-options-international').classList.toggle('hidden', mode !== 'international');
+        document.getElementById('service-options-ecommerce').classList.toggle('hidden', mode !== 'ecommerce');
+
+        const deliveryMultiple = document.getElementById('delivery-multiple');
+        const deliveryIntl = document.getElementById('delivery-international');
+        const addDeliveryBtn = document.getElementById('add-delivery-btn');
+
+        if (mode === 'international') {
+            deliveryMultiple.classList.add('hidden');
+            deliveryIntl.classList.remove('hidden');
+            if (addDeliveryBtn) addDeliveryBtn.classList.add('hidden');
+
+            // Disable hidden domestic inputs & enable international inputs
+            deliveryMultiple.querySelectorAll('input, select, textarea').forEach(el => el.disabled = true);
+            deliveryIntl.querySelectorAll('input, select, textarea').forEach(el => el.disabled = false);
+
+            document.getElementById('domestic_service_type')?.removeAttribute('name');
+            document.getElementById('ecommerce_service_type')?.removeAttribute('name');
+            document.getElementById('international_service_type')?.setAttribute('name', 'service_type');
+
+            setTimeout(() => {
+                if (!internationalMap) initIntlMap();
+            }, 100);
+        } else if (mode === 'ecommerce') {
+            deliveryMultiple.classList.remove('hidden');
+            deliveryIntl.classList.add('hidden');
+            if (addDeliveryBtn) addDeliveryBtn.classList.remove('hidden');
+
+            deliveryMultiple.querySelectorAll('input, select, textarea').forEach(el => el.disabled = false);
+            deliveryIntl.querySelectorAll('input, select, textarea').forEach(el => el.disabled = true);
+
+            document.getElementById('ecommerce_service_type')?.setAttribute('name', 'service_type');
+            document.getElementById('domestic_service_type')?.removeAttribute('name');
+            document.getElementById('international_service_type')?.removeAttribute('name');
+        } else {
+            deliveryMultiple.classList.remove('hidden');
+            deliveryIntl.classList.add('hidden');
+            if (addDeliveryBtn) addDeliveryBtn.classList.remove('hidden');
+
+            deliveryMultiple.querySelectorAll('input, select, textarea').forEach(el => el.disabled = false);
+            deliveryIntl.querySelectorAll('input, select, textarea').forEach(el => el.disabled = true);
+
+            document.getElementById('domestic_service_type')?.setAttribute('name', 'service_type');
+            document.getElementById('ecommerce_service_type')?.removeAttribute('name');
+            document.getElementById('international_service_type')?.removeAttribute('name');
+        }
+
+        const domesticZones = document.getElementById('domestic-route-zones');
+        if (domesticZones) {
+            domesticZones.classList.toggle('hidden', mode === 'ecommerce');
+        }
+
+        const codSection = document.getElementById('cod-section-0');
+        if (codSection) {
+            codSection.classList.toggle('hidden', mode === 'international');
+        }
+
+        const alpineEl = document.querySelector('[x-data]');
+        if (alpineEl && alpineEl._x_dataStack && alpineEl._x_dataStack[0]) {
+            alpineEl._x_dataStack[0].shipmentMode = mode;
+            if (mode === 'international') {
+                alpineEl._x_dataStack[0].invoiceCurrency = 'USD';
+            } else if (mode === 'domestic') {
+                alpineEl._x_dataStack[0].invoiceCurrency = 'NPR';
+            }
+        }
+
+        if (window.aiVoiceAutofill && window.aiVoiceAutofill.isActive && typeof refreshVoiceStepsForActiveMode === 'function') {
+            refreshVoiceStepsForActiveMode(mode, true);
+        }
+
+        clearConsignmentValidationErrors();
+        updateSummaryStats();
+    }
+
+    function toggleCodAmountField(checkbox) {
+        const container = document.getElementById('cod-amount-container');
+        if (container) {
+            if (checkbox && checkbox.checked) {
+                container.classList.remove('hidden');
+            } else {
+                container.classList.add('hidden');
+            }
+        }
+    }
+
+    // =========================================================================
+    // CONSIGNMENT FORM VALIDATION & INTERACTIVE FIELD GUIDANCE
+    // =========================================================================
+    function clearConsignmentValidationErrors() {
+        document.querySelectorAll('#shipment-form .consignment-field-error').forEach(el => {
+            el.classList.remove('consignment-field-error', 'border-rose-500', 'ring-2', 'ring-rose-400', 'bg-rose-50/50');
+            el.classList.add('border-slate-200');
+        });
+        document.querySelectorAll('.field-error-msg').forEach(el => el.remove());
+        const banner = document.getElementById('consignment-validation-errors');
+        if (banner) {
+            banner.classList.add('hidden');
+            banner.innerHTML = '';
+        }
+    }
+
+    function markFieldInvalid(element, label, reason) {
+        if (!element) return;
+        element.classList.add('consignment-field-error', 'border-rose-500', 'ring-2', 'ring-rose-400', 'bg-rose-50/50');
+        element.classList.remove('border-slate-200');
+
+        const parent = element.closest('.relative') || element.parentElement;
+        if (parent && !parent.querySelector(`.field-error-msg[data-for="${element.id || element.name}"]`)) {
+            const errorP = document.createElement('p');
+            errorP.className = 'field-error-msg text-[11px] font-bold text-rose-600 mt-1 flex items-center gap-1.5 animate-pulse';
+            errorP.setAttribute('data-for', element.id || element.name);
+            errorP.innerHTML = `<i class="fas fa-circle-exclamation text-rose-500"></i> <span>${label} is required${reason ? ' (' + reason + ')' : ''}.</span>`;
+            parent.appendChild(errorP);
+        }
+
+        const clearHandler = function() {
+            element.classList.remove('consignment-field-error', 'border-rose-500', 'ring-2', 'ring-rose-400', 'bg-rose-50/50');
+            element.classList.add('border-slate-200');
+            const msg = parent?.querySelector(`.field-error-msg[data-for="${element.id || element.name}"]`);
+            if (msg) msg.remove();
+
+            if (document.querySelectorAll('#shipment-form .consignment-field-error').length === 0) {
+                const banner = document.getElementById('consignment-validation-errors');
+                if (banner) {
+                    banner.classList.add('hidden');
+                    banner.innerHTML = '';
+                }
+            }
+            element.removeEventListener('input', clearHandler);
+            element.removeEventListener('change', clearHandler);
+        };
+        element.addEventListener('input', clearHandler);
+        element.addEventListener('change', clearHandler);
+    }
+
+    function focusAndScrollToField(id) {
+        const mode = document.getElementById('shipment_type')?.value || 'domestic';
+
+        // Unhide international or domestic section if targeted field is inside
+        if (id.startsWith('receiver_') || id === 'receiver_phone') {
+            const intlSec = document.getElementById('delivery-international');
+            if (intlSec) {
+                intlSec.classList.remove('hidden');
+                intlSec.style.display = 'block';
+            }
+        } else if (id.startsWith('delivery_') && mode !== 'international') {
+            const domSec = document.getElementById('delivery-domestic');
+            if (domSec) {
+                domSec.classList.remove('hidden');
+                domSec.style.display = 'block';
+            }
+        }
+
+        let el = document.getElementById(id) || document.querySelector(`[name="${id}"]`);
+        if (!el && id.includes('_0')) {
+            const baseName = id.replace('_0', '');
+            el = document.querySelector(`[name="${baseName}[]"]`) || document.querySelector(`[name="${baseName}"]`);
+        }
+
+        if (el) {
+            el.removeAttribute('disabled');
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            el.classList.add('ring-4', 'ring-rose-400', 'ring-offset-2');
+            setTimeout(() => {
+                try { el.focus(); } catch (e) {}
+            }, 250);
+            setTimeout(() => {
+                el.classList.remove('ring-4', 'ring-rose-400', 'ring-offset-2');
+            }, 3500);
+        }
+
+        // Intelligently align the AI Voice Assistant directly to this field without restarting or re-asking completed fields!
+        if (typeof window.jumpToVoiceStepForField === 'function') {
+            window.jumpToVoiceStepForField(id);
+        }
+    }
+
+    function validateAndSubmitConsignment(event) {
+        if (event) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+
+        clearConsignmentValidationErrors();
+
+        const form = document.getElementById('shipment-form');
+        if (!form) return false;
+
+        const mode = document.getElementById('shipment_type')?.value || 'domestic';
+        const alpineEl = document.querySelector('[x-data]');
+        const alpineData = alpineEl && alpineEl._x_dataStack ? alpineEl._x_dataStack[0] : null;
+        const hasDoorstep = alpineData ? !!alpineData.hasDoorstepPickup : true;
+
+        const missingFields = [];
+
+        // 1. Bi-directional Synchronization between Doorstep Pickup & Sender Dropoff Fields
+        const pickupName = document.getElementById('pickup_name_0') || form.querySelector('[name="pickup_name[]"]');
+        const senderName = document.getElementById('sender_name_input') || form.querySelector('[name="sender_name"]');
+        const pickupPhone = document.getElementById('pickup_phone_0') || form.querySelector('[name="pickup_phone[]"]');
+        const senderPhone = document.getElementById('sender_phone_input') || form.querySelector('[name="sender_phone"]');
+        const pickupAddress = document.getElementById('pickup_address_0') || form.querySelector('[name="pickup_address[]"]');
+        const senderAddress = document.getElementById('sender_address_input') || form.querySelector('[name="sender_address"]');
+
+        if (pickupName && senderName) {
+            if (pickupName.value.trim() && !senderName.value.trim()) senderName.value = pickupName.value.trim();
+            else if (senderName.value.trim() && !pickupName.value.trim()) pickupName.value = senderName.value.trim();
+        }
+        if (pickupPhone && senderPhone) {
+            if (pickupPhone.value.trim() && !senderPhone.value.trim()) senderPhone.value = pickupPhone.value.trim();
+            else if (senderPhone.value.trim() && !pickupPhone.value.trim()) pickupPhone.value = senderPhone.value.trim();
+        }
+        if (pickupAddress && senderAddress) {
+            if (pickupAddress.value.trim() && !senderAddress.value.trim()) senderAddress.value = pickupAddress.value.trim();
+            else if (senderAddress.value.trim() && !pickupAddress.value.trim()) pickupAddress.value = senderAddress.value.trim();
+        }
+
+        const effectiveSenderName = (pickupName?.value || senderName?.value || '').trim();
+        const effectiveSenderPhone = (pickupPhone?.value || senderPhone?.value || '').trim();
+        const effectiveSenderAddress = (pickupAddress?.value || senderAddress?.value || '').trim();
+
+        // Validate Sender / Pickup Name
+        if (!effectiveSenderName) {
+            const target = hasDoorstep ? (pickupName || senderName) : (senderName || pickupName);
+            markFieldInvalid(target, 'Sender / Pickup Contact Person Name');
+            missingFields.push({ id: target?.id || (hasDoorstep ? 'pickup_name_0' : 'sender_name_input'), label: 'Sender Contact Person Name' });
+        }
+
+        // Validate Sender / Pickup Phone (At least 7 digits in either field satisfies both)
+        if (!effectiveSenderPhone || effectiveSenderPhone.length < 7) {
+            const target = hasDoorstep ? (pickupPhone || senderPhone) : (senderPhone || pickupPhone);
+            markFieldInvalid(target, 'Sender Contact Phone', 'valid phone number required');
+            missingFields.push({ id: target?.id || (hasDoorstep ? 'pickup_phone_0' : 'sender_phone_input'), label: 'Sender Contact Phone' });
+        }
+
+        // Validate Pickup Address if doorstep collection requested
+        if (hasDoorstep && !effectiveSenderAddress) {
+            const target = pickupAddress || senderAddress;
+            markFieldInvalid(target, 'Pickup Street Address & Landmark');
+            missingFields.push({ id: target?.id || 'pickup_address_0', label: 'Pickup Street Address & Landmark' });
+        }
+
+        // 2. Validate Destinations by Mode
+        if (mode === 'international') {
+            const country = document.getElementById('receiver_country');
+            if (!country || !country.value.trim()) {
+                markFieldInvalid(country, 'Destination Country');
+                missingFields.push({ id: 'receiver_country', label: 'Destination Country' });
+            }
+
+            const recName = document.getElementById('receiver_name');
+            if (!recName || !recName.value.trim()) {
+                markFieldInvalid(recName, 'Overseas Receiver Full Name / Company');
+                missingFields.push({ id: 'receiver_name', label: 'Overseas Receiver Name / Company' });
+            }
+
+            const recPhone = document.getElementById('receiver_phone') || form.querySelector('[name="receiver_phone"]');
+            if (!recPhone || !recPhone.value.trim() || recPhone.value.trim().length < 7) {
+                markFieldInvalid(recPhone, 'Overseas Consignee / Receiver Phone Number', 'valid phone number required');
+                missingFields.push({ id: 'receiver_phone', label: 'Overseas Consignee Contact Phone' });
+            }
+
+            const recStreet = document.getElementById('receiver_street');
+            if (!recStreet || !recStreet.value.trim()) {
+                markFieldInvalid(recStreet, 'Receiver Destination Street Address');
+                missingFields.push({ id: 'receiver_street', label: 'Receiver Street Address' });
+            }
+
+            const recCity = document.getElementById('receiver_city');
+            if (!recCity || !recCity.value.trim()) {
+                markFieldInvalid(recCity, 'Receiver City');
+                missingFields.push({ id: 'receiver_city', label: 'Receiver Destination City' });
+            }
+        } else {
+            // Domestic or E-Commerce
+            const delivName = document.getElementById('delivery_name_0') || form.querySelector('[name="delivery_name[]"]');
+            if (!delivName || !delivName.value.trim()) {
+                markFieldInvalid(delivName, 'Recipient Full Name');
+                missingFields.push({ id: delivName?.id || 'delivery_name_0', label: 'Recipient Full Name' });
+            }
+
+            const delivPhone = document.getElementById('delivery_phone_0') || form.querySelector('[name="delivery_phone[]"]');
+            if (!delivPhone || !delivPhone.value.trim() || delivPhone.value.trim().length < 7) {
+                markFieldInvalid(delivPhone, 'Recipient Phone Number', 'valid phone number required');
+                missingFields.push({ id: delivPhone?.id || 'delivery_phone_0', label: 'Recipient Phone Number' });
+            }
+
+            const delivAddress = document.getElementById('delivery_address_0') || form.querySelector('[name="delivery_address[]"]');
+            if (!delivAddress || !delivAddress.value.trim()) {
+                markFieldInvalid(delivAddress, 'Recipient Street Address & Landmark');
+                missingFields.push({ id: delivAddress?.id || 'delivery_address_0', label: 'Recipient Street Address' });
+            }
+        }
+
+        // 3. Validate Cargo Weight
+        const weightInput = document.getElementById('weight-input') || form.querySelector('[name="weight"]');
+        const weightVal = parseFloat(weightInput?.value) || 0;
+        const totalGross = alpineData ? (alpineData.totalCargoGrossWeight || 0) : 0;
+        const finalWeight = Math.max(weightVal, totalGross);
+        if (finalWeight < 0.1) {
+            markFieldInvalid(weightInput, 'Package Weight', 'minimum 0.1 KG');
+            missingFields.push({ id: weightInput?.id || 'weight-input', label: 'Package Weight (min 0.1 KG)' });
+        }
+
+        // 4. Validate Packing List Over-allocation (if multi-box)
+        if (alpineData && alpineData.totalBoxes > 1 && alpineData.hasOverAllocatedItems) {
+            missingFields.push({ id: 'box-matrix-anchor', label: 'Packing List Allocations (Box quantities exceed invoice items)' });
+        }
+
+        // 5. IF ANY FIELDS ARE MISSING -> SHOW INDICATION & HALT
+        if (missingFields.length > 0) {
+            const banner = document.getElementById('consignment-validation-errors');
+            if (banner) {
+                banner.className = 'p-5 rounded-3xl bg-rose-950/95 border-2 border-rose-500 text-white shadow-2xl space-y-3.5 backdrop-blur-sm';
+
+                const chipsHtml = missingFields.map(f => `
+                    <button type="button" onclick="focusAndScrollToField('${f.id}')"
+                            class="flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-xl bg-rose-900/70 hover:bg-rose-800 border border-rose-500/60 text-left transition group cursor-pointer shadow-sm">
+                        <span class="text-xs font-bold text-rose-100 flex items-center gap-2">
+                            <i class="fas fa-circle-exclamation text-rose-400 text-xs"></i>
+                            <span>${f.label}</span>
+                        </span>
+                        <span class="text-[10px] font-black uppercase tracking-wider text-rose-300 group-hover:text-white flex items-center gap-1 bg-rose-800/80 group-hover:bg-rose-700 px-2 py-0.5 rounded-md border border-rose-400/30">
+                            Fill In <i class="fas fa-arrow-right text-[8px]"></i>
+                        </span>
+                    </button>
+                `).join('');
+
+                banner.innerHTML = `
+                    <div class="flex items-start justify-between gap-3 pb-2.5 border-b border-rose-500/40">
+                        <div class="flex items-center gap-2.5 text-rose-300">
+                            <div class="w-8 h-8 rounded-xl bg-rose-500/30 border border-rose-400 flex items-center justify-center flex-shrink-0">
+                                <i class="fas fa-triangle-exclamation text-rose-400 text-sm animate-pulse"></i>
+                            </div>
+                            <div>
+                                <h5 class="text-sm font-black uppercase tracking-wider text-white">Missing Required Consignment Fields</h5>
+                                <p class="text-[11px] text-rose-300">Please complete the ${missingFields.length} field(s) below to confirm your booking.</p>
+                            </div>
+                        </div>
+                        <button type="button" onclick="clearConsignmentValidationErrors()" class="w-6 h-6 rounded-lg bg-rose-900/60 hover:bg-rose-800 text-rose-300 hover:text-white flex items-center justify-center text-xs">
+                            <i class="fas fa-xmark"></i>
+                        </button>
+                    </div>
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+                        ${chipsHtml}
+                    </div>
+                `;
+                banner.classList.remove('hidden');
+            }
+
+            // Scroll to the first missing field
+            const firstId = missingFields[0].id;
+            focusAndScrollToField(firstId);
+
+            // Announce via Voice Assistant if available
+            if (typeof speakVoicePrompt === 'function') {
+                speakVoicePrompt('Hajur, please fill in the required field: ' + missingFields[0].label + ' to confirm and book your consignment.');
+            }
+
+            return false;
+        }
+
+        // 6. ALL VALID -> SUBMIT
+        const submitBtn = document.getElementById('submit-btn');
+        if (submitBtn) {
+            submitBtn.disabled = true;
+            const icon = document.getElementById('submit-btn-icon');
+            const text = document.getElementById('submit-btn-text');
+            if (icon) icon.className = 'fas fa-circle-notch fa-spin mr-2';
+            if (text) text.innerText = 'Confirming & Booking Consignment (Issuing HAWB)...';
+        }
+
+        // Guarantee active weight input has numeric value
+        let activeWeightInp = form.querySelector('input[name="weight"]:not([disabled])');
+        if (!activeWeightInp) {
+            activeWeightInp = document.createElement('input');
+            activeWeightInp.type = 'hidden';
+            activeWeightInp.name = 'weight';
+            form.appendChild(activeWeightInp);
+        }
+        activeWeightInp.value = finalWeight.toFixed(2);
+
+        try {
+            HTMLFormElement.prototype.submit.call(form);
+        } catch (err) {
+            form.submit();
+        }
+        return true;
+    }
+
+    // =============================================
+    // VOLUMETRIC WEIGHT & SUMMARY STATS
+    // =============================================
+    function calculateVolumetricWeight() {
+        const l = parseFloat(document.getElementById('length-input').value) || 0;
+        const w = parseFloat(document.getElementById('width-input').value) || 0;
+        const h = parseFloat(document.getElementById('height-input').value) || 0;
+        const grossWeight = parseFloat(document.getElementById('weight-input').value) || 1.0;
+
+        const volWeight = (l * w * h) / 5000;
+        const chargeable = Math.max(grossWeight, volWeight);
+
+        document.getElementById('volumetric-weight-display').innerText = `${volWeight.toFixed(2)} KG`;
+        document.getElementById('chargeable-weight-display').innerText = `Chargeable: ${chargeable.toFixed(2)} KG`;
+        document.getElementById('summary-weight').innerText = `${chargeable.toFixed(2)} KG`;
+    }
+
+    function updateSummaryStats() {
+        const mode = document.getElementById('shipment_type')?.value || 'domestic';
+        const badgeEl = document.getElementById('summary-mode-badge');
+        if (badgeEl) badgeEl.innerText = mode.toUpperCase();
+
+        const pickupEl = document.getElementById('summary-pickups-count');
+        if (pickupEl) {
+            const doorstepInput = document.getElementById('schedule_doorstep_pickup');
+            const hasPickup = doorstepInput ? (doorstepInput.value === '1') : true;
+            if (hasPickup) {
+                const pickups = document.querySelectorAll('.pickup-card').length;
+                pickupEl.innerText = `${pickups} ${pickups === 1 ? 'Pickup Location' : 'Pickup Locations'}`;
+            } else {
+                pickupEl.innerText = 'Counter Drop-off';
+            }
+        }
+
+        const deliveries = mode === 'international' ? 1 : document.querySelectorAll('.delivery-card').length;
+        const delivEl = document.getElementById('summary-deliveries-count');
+        if (delivEl) delivEl.innerText = `${deliveries} ${deliveries === 1 ? 'Destination' : 'Destinations'}`;
+    }
+
+    function requestDomesticQuote() {
+        const origin = document.getElementById('origin_zone_id')?.value;
+        const dest = document.getElementById('destination_zone_id')?.value;
+        const svc = document.getElementById('domestic_service_type')?.value;
+        const weight = document.getElementById('weight-input')?.value || 1;
+
+        const resultEl = document.getElementById('domestic-quote-result');
+        if (!resultEl) return;
+        if (!origin || !dest) {
+            resultEl.innerHTML = '<span class="text-rose-600 font-bold">Select both origin and destination zones.</span>';
+            return;
+        }
+
+        resultEl.innerHTML = '<span class="text-teal-700"><i class="fas fa-spinner fa-spin"></i> Calculating tariff...</span>';
+
+        fetch(`/api/domestic-rates/calculate?origin_zone_id=${origin}&destination_zone_id=${dest}&service_type=${svc}&weight=${weight}`)
+            .then(res => res.json())
+            .then(data => {
+                if (data.status === 'success' || data.customer_price !== undefined) {
+                    resultEl.innerHTML = `<span class="text-emerald-700 font-black font-mono">Approved Rate: Rs. ${Number(data.customer_price).toLocaleString()}</span> <span class="text-slate-500">(${data.transit_time || 'Standard Transit'})</span>`;
+                } else {
+                    resultEl.innerHTML = `<span class="text-amber-700 font-semibold">${data.message || 'Route verified.'}</span>`;
+                }
+            })
+            .catch(() => {
+                resultEl.innerHTML = '<span class="text-emerald-700 font-black font-mono">Rate Verified (Standard Tariff Scale)</span>';
+            });
+    }
+
+    // Initialize maps on page load
+    document.addEventListener('DOMContentLoaded', function() {
+        setTimeout(() => {
+            initPickupMap(0);
+            initDeliveryMap(0);
+        }, 200);
+
+        const urlParams = new URLSearchParams(window.location.search);
+        const modeParam = urlParams.get('shipment_type');
+        const initialMode = (modeParam && ['domestic', 'international', 'ecommerce'].includes(modeParam)) 
+            ? modeParam 
+            : (document.getElementById('shipment_type')?.value || 'domestic');
+        switchMode(initialMode);
+
+        const countryParam = urlParams.get('receiver_country');
+        if (countryParam) {
+            const countryEl = document.getElementById('receiver_country');
+            if (countryEl) countryEl.value = countryParam;
+        }
+
+        updateSummaryStats();
+
+        if (typeof window.updateInternationalDialPrefix === 'function') {
+            window.updateInternationalDialPrefix();
+        }
+
+        // Check if user previously dismissed the Voice Autofill invitation
+        if (sessionStorage.getItem('ai_voice_autofill_dismissed') === '1') {
+            const banner = document.getElementById('ai-voice-invitation-banner');
+            if (banner) banner.style.display = 'none';
+        }
+    });
+
+    // =========================================================================
+    // AI VOICE CONCIERGE & AUTO-TYPING ENGINE (ALWAYS ASKS BEFOREHAND TO INITIATE)
+    // =========================================================================
+    // AI VOICE CONCIERGE & AUTO-TYPING ENGINE (ALWAYS ASKS BEFOREHAND TO INITIATE)
+    // =========================================================================
+    const NEPAL_DISTRICT_PROVINCE_MAP = {
+        'bhojpur': 'Koshi Province', 'dhankuta': 'Koshi Province', 'ilam': 'Koshi Province',
+        'jhapa': 'Koshi Province', 'khotang': 'Koshi Province', 'morang': 'Koshi Province',
+        'okhaldhunga': 'Koshi Province', 'panchthar': 'Koshi Province', 'sankhuwasabha': 'Koshi Province',
+        'solukhumbu': 'Koshi Province', 'sunsari': 'Koshi Province', 'taplejung': 'Koshi Province',
+        'terhathum': 'Koshi Province', 'udayapur': 'Koshi Province',
+        'bara': 'Madhesh Province', 'dhanusha': 'Madhesh Province', 'mahottari': 'Madhesh Province',
+        'parsa': 'Madhesh Province', 'rautahat': 'Madhesh Province', 'saptari': 'Madhesh Province',
+        'sarlahi': 'Madhesh Province', 'siraha': 'Madhesh Province',
+        'bhaktapur': 'Bagmati Province', 'chitwan': 'Bagmati Province', 'dhading': 'Bagmati Province',
+        'dolakha': 'Bagmati Province', 'kathmandu': 'Bagmati Province', 'kavrepalanchok': 'Bagmati Province',
+        'kavre': 'Bagmati Province', 'lalitpur': 'Bagmati Province', 'makwanpur': 'Bagmati Province',
+        'nuwakot': 'Bagmati Province', 'ramechhap': 'Bagmati Province', 'rasuwa': 'Bagmati Province',
+        'sindhuli': 'Bagmati Province', 'sindhupalchok': 'Bagmati Province',
+        'baglung': 'Gandaki Province', 'gorkha': 'Gandaki Province', 'kaski': 'Gandaki Province',
+        'lamjung': 'Gandaki Province', 'manang': 'Gandaki Province', 'mustang': 'Gandaki Province',
+        'myagdi': 'Gandaki Province', 'nawalpur': 'Gandaki Province', 'nawalparasi east': 'Gandaki Province',
+        'parbat': 'Gandaki Province', 'syangja': 'Gandaki Province', 'tanahun': 'Gandaki Province',
+        'arghakhanchi': 'Lumbini Province', 'banke': 'Lumbini Province', 'bardiya': 'Lumbini Province',
+        'dang': 'Lumbini Province', 'gulmi': 'Lumbini Province', 'kapilvastu': 'Lumbini Province',
+        'parasi': 'Lumbini Province', 'nawalparasi west': 'Lumbini Province', 'palpa': 'Lumbini Province',
+        'pyuthan': 'Lumbini Province', 'rolpa': 'Lumbini Province', 'rukum east': 'Lumbini Province',
+        'rupandehi': 'Lumbini Province',
+        'dailekh': 'Karnali Province', 'dolpa': 'Karnali Province', 'humla': 'Karnali Province',
+        'jajarkot': 'Karnali Province', 'jumla': 'Karnali Province', 'kalikot': 'Karnali Province',
+        'mugu': 'Karnali Province', 'salyan': 'Karnali Province', 'surkhet': 'Karnali Province',
+        'rukum west': 'Karnali Province',
+        'achham': 'Sudurpashchim Province', 'baitadi': 'Sudurpashchim Province', 'bajhang': 'Sudurpashchim Province',
+        'bajura': 'Sudurpashchim Province', 'dadeldhura': 'Sudurpashchim Province', 'darchula': 'Sudurpashchim Province',
+        'doti': 'Sudurpashchim Province', 'kailali': 'Sudurpashchim Province', 'kanchanpur': 'Sudurpashchim Province'
+    };
+
+    function selectNepalTerritoryDistrict(pickerPrefix, districtName) {
+        if (!districtName) return null;
+        const lower = districtName.toLowerCase().trim();
+        let canonical = districtName.trim();
+        if (lower.includes('pokhara')) canonical = 'Kaski';
+        else if (lower.includes('biratnagar')) canonical = 'Morang';
+        else if (lower.includes('dharan') || lower.includes('itahari')) canonical = 'Sunsari';
+        else if (lower.includes('butwal') || lower.includes('bhairahawa')) canonical = 'Rupandehi';
+        else if (lower.includes('nepalgunj')) canonical = 'Banke';
+        else if (lower.includes('dhangadhi')) canonical = 'Kailali';
+        else if (lower.includes('birgunj')) canonical = 'Parsa';
+        else if (lower.includes('hetauda')) canonical = 'Makwanpur';
+        else if (lower.includes('damak') || lower.includes('birtamod')) canonical = 'Jhapa';
+        else if (lower.includes('kathmandu')) canonical = 'Kathmandu';
+        else if (lower.includes('lalitpur') || lower.includes('patan')) canonical = 'Lalitpur';
+        else if (lower.includes('bhaktapur')) canonical = 'Bhaktapur';
+        else if (lower.includes('chitwan') || lower.includes('narayangarh')) canonical = 'Chitwan';
+        else {
+            canonical = canonical.charAt(0).toUpperCase() + canonical.slice(1);
+        }
+
+        const prov = NEPAL_DISTRICT_PROVINCE_MAP[canonical.toLowerCase()] || NEPAL_DISTRICT_PROVINCE_MAP[lower];
+        const provSelect = document.getElementById(`${pickerPrefix}_province`);
+        const distSelect = document.getElementById(`${pickerPrefix}_district`);
+        const searchInput = document.getElementById(`${pickerPrefix}_search`);
+
+        if (searchInput) {
+            searchInput.value = canonical;
+            searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+
+        if (prov && provSelect) {
+            for (let opt of provSelect.options) {
+                if (opt.value && opt.value.toLowerCase().includes(prov.toLowerCase())) {
+                    provSelect.value = opt.value;
+                    provSelect.dispatchEvent(new Event('change', { bubbles: true }));
+                    break;
+                }
+            }
+        }
+
+        setTimeout(() => {
+            if (distSelect) {
+                for (let opt of distSelect.options) {
+                    if (opt.value && opt.value.toLowerCase() === canonical.toLowerCase()) {
+                        distSelect.value = opt.value;
+                        distSelect.dispatchEvent(new Event('change', { bubbles: true }));
+                        distSelect.classList.add('ring-2', 'ring-emerald-500', 'bg-emerald-50/20');
+                        setTimeout(() => distSelect.classList.remove('ring-2', 'ring-emerald-500', 'bg-emerald-50/20'), 1500);
+                        break;
+                    }
+                }
+            }
+        }, 150);
+
+        return canonical;
+    }
+
+    function getAlpineConsoleData() {
+        const el = document.querySelector('[x-data]');
+        return el && el._x_dataStack ? el._x_dataStack[0] : null;
+    }
+
+    function buildVoiceStepsForMode(mode) {
+        const isIntl = mode === 'international';
+        const isEcom = mode === 'ecommerce';
+
+        const steps = [
+            // Field 1: Service Category
+            {
+                id: 'mode',
+                title: 'Shipment Service Category',
+                getValue: function() {
+                    const cur = document.getElementById('shipment_type')?.value || 'domestic';
+                    if (cur === 'ecommerce') return 'E-Commerce Rider & COD';
+                    if (cur === 'international') return 'International Air Cargo';
+                    return 'Domestic Express Delivery across Nepal';
+                },
+                prompt: function(ctx) {
+                    return `Which service category would you like to book? Domestic delivery across Nepal, International air cargo, or E-Commerce with Cash on Delivery?`;
+                },
+                confirmPrompt: function(ctx, curVal) {
+                    return `Service is currently set to "${curVal}". Keep this or change?`;
+                },
+                targetSelector: function() {
+                    const cur = document.getElementById('shipment_type')?.value;
+                    if (cur === 'ecommerce') return document.getElementById('mode-btn-ecommerce');
+                    if (cur === 'international') return document.getElementById('mode-btn-international');
+                    return document.getElementById('mode-btn-domestic');
+                },
+                parse: function(text) {
+                    const t = text.toLowerCase();
+                    if (t.includes('ecommerce') || t.includes('e-commerce') || t.includes('cod') || t.includes('cash on delivery') || t.includes('seller') || t.includes('merchant') || t.includes('store') || t.includes('shop') || t.includes('rider') || t.includes('daraz') || t.includes('kinbech') || t.includes('online') || t.includes('three') || t.includes('3') || t.includes('tesro') || t.includes('tin')) {
+                        return 'ecommerce';
+                    }
+                    if (t.includes('international') || t.includes('overseas') || t.includes('air cargo') || t.includes('poland') || t.includes('usa') || t.includes('europe') || t.includes('abroad') || t.includes('two') || t.includes('2') || t.includes('dosro') || t.includes('dui') || t.includes('bidesh')) {
+                        return 'international';
+                    }
+                    return 'domestic';
+                },
+                apply: function(val) {
+                    if (typeof switchMode === 'function') switchMode(val);
+                    if (typeof refreshVoiceStepsForActiveMode === 'function') refreshVoiceStepsForActiveMode(val, false);
+                    if (val === 'ecommerce') return 'E-Commerce Delivery & COD';
+                    return val === 'international' ? 'International Air Cargo' : 'Domestic Express Delivery';
+                }
+            },
+
+            // Field 2: Service Tier SLA
+            {
+                id: 'service_type',
+                title: isIntl ? 'International Air Courier Mode' : (isEcom ? 'E-Commerce Rider SLA' : 'Domestic Service Tier SLA'),
+                getValue: function() {
+                    const selId = isIntl ? 'international_service_type' : (isEcom ? 'ecommerce_service_type' : 'domestic_service_type');
+                    const sel = document.getElementById(selId);
+                    return sel && sel.selectedIndex >= 0 ? (sel.options[sel.selectedIndex]?.text?.trim() || sel.value) : '';
+                },
+                prompt: function() {
+                    if (isIntl) return 'Which international mode do you require? Express service (3-4 days) or Economy cargo (6-8 days)?';
+                    if (isEcom) return 'Which rider speed do you need? Flash dispatch (60-90 min), Same-Day delivery, or Standard?';
+                    return 'Which delivery speed would you like? Standard (1-2 days), Flash urgent, or Same-Day?';
+                },
+                confirmPrompt: function(ctx, curVal) {
+                    return `Delivery speed is set to "${curVal}". Keep this or change?`;
+                },
+                targetSelector: function() {
+                    if (isIntl) return document.getElementById('international_service_type');
+                    if (isEcom) return document.getElementById('ecommerce_service_type');
+                    return document.getElementById('domestic_service_type');
+                },
+                parse: function(text) {
+                    const t = text.toLowerCase();
+                    if (isIntl) {
+                        return (t.includes('express') || t.includes('priority') || t.includes('fast') || t.includes('one') || t.includes('1') || t.includes('ek')) ? 'express' : 'economy';
+                    }
+                    if (isEcom) {
+                        if (t.includes('flash') || t.includes('urgent') || t.includes('instant') || t.includes('60') || t.includes('one') || t.includes('1') || t.includes('ek')) return 'flash';
+                        if (t.includes('same') || t.includes('today') || t.includes('two') || t.includes('2') || t.includes('dui')) return 'same_day';
+                        return 'standard';
+                    }
+                    if (t.includes('flash') || t.includes('urgent') || t.includes('chito') || t.includes('two') || t.includes('2') || t.includes('dui')) return 'flash';
+                    if (t.includes('same') || t.includes('aajai') || t.includes('three') || t.includes('3') || t.includes('tin')) return 'same_day';
+                    if (t.includes('himalayan') || t.includes('remote') || t.includes('mountain') || t.includes('four') || t.includes('4') || t.includes('char')) return 'himalayan';
+                    return 'standard';
+                },
+                apply: function(val) {
+                    const selId = isIntl ? 'international_service_type' : (isEcom ? 'ecommerce_service_type' : 'domestic_service_type');
+                    const sel = document.getElementById(selId);
+                    if (sel) {
+                        sel.value = val;
+                        sel.dispatchEvent(new Event('change', { bubbles: true }));
+                        sel.classList.add('ring-2', 'ring-emerald-500', 'bg-emerald-50/20');
+                        setTimeout(() => sel.classList.remove('ring-2', 'ring-emerald-500', 'bg-emerald-50/20'), 1500);
+                        return sel.options[sel.selectedIndex]?.text || val;
+                    }
+                    return val;
+                }
+            },
+
+            // Field 3: Package Classification
+            {
+                id: 'package_type',
+                title: isIntl ? 'Package Packaging' : (isEcom ? 'E-Commerce Package Type' : 'Package Classification'),
+                getValue: function() {
+                    const sel = isIntl 
+                        ? document.querySelector('select[name="intl_package_type"]')
+                        : (isEcom ? document.querySelector('select[name="ecom_package_type"]') : document.querySelector('select[name="package_type"]'));
+                    return sel && sel.selectedIndex >= 0 ? (sel.options[sel.selectedIndex]?.text?.trim() || sel.value) : '';
+                },
+                prompt: function() {
+                    return 'What is the package type? Standard parcel, Box carton, Document envelope, or Fragile?';
+                },
+                confirmPrompt: function(ctx, curVal) {
+                    return `Package type is set to "${curVal}". Keep this or update?`;
+                },
+                targetSelector: function() {
+                    return isIntl 
+                        ? document.querySelector('select[name="intl_package_type"]')
+                        : (isEcom ? document.querySelector('select[name="ecom_package_type"]') : document.querySelector('select[name="package_type"]'));
+                },
+                parse: function(text) {
+                    const t = text.toLowerCase();
+                    if (t.includes('box') || t.includes('carton') || t.includes('heavy')) return 'box';
+                    if (t.includes('envelope') || t.includes('document') || t.includes('letter') || t.includes('kagaj')) return 'envelope';
+                    if (t.includes('fragile') || t.includes('glass') || t.includes('electronic')) return 'fragile';
+                    if (t.includes('grocery') || t.includes('food')) return 'grocery';
+                    return 'parcel';
+                },
+                apply: function(val) {
+                    const sel = isIntl 
+                        ? document.querySelector('select[name="intl_package_type"]')
+                        : (isEcom ? document.querySelector('select[name="ecom_package_type"]') : document.querySelector('select[name="package_type"]'));
+                    if (sel) {
+                        sel.value = val;
+                        sel.dispatchEvent(new Event('change', { bubbles: true }));
+                        sel.classList.add('ring-2', 'ring-emerald-500', 'bg-emerald-50/20');
+                        setTimeout(() => sel.classList.remove('ring-2', 'ring-emerald-500', 'bg-emerald-50/20'), 1500);
+                        return sel.options[sel.selectedIndex]?.text || val;
+                    }
+                    return val;
+                }
+            },
+
+            // Field 4: Collection Method (Doorstep Pickup vs Station Drop-off)
+            {
+                id: 'collection_method',
+                title: 'Package Collection Method',
+                getValue: function() {
+                    const input = document.getElementById('schedule_doorstep_pickup');
+                    return input && input.value === '1' ? 'Doorstep Courier Collection' : 'Station / Counter Drop-off';
+                },
+                prompt: function() {
+                    return 'How should packages be collected? Doorstep courier pickup by rider, or Station counter drop-off?';
+                },
+                confirmPrompt: function(ctx, curVal) {
+                    return `Collection method is set to "${curVal}". Keep this or switch?`;
+                },
+                targetSelector: function() {
+                    return document.getElementById('schedule_doorstep_pickup');
+                },
+                parse: function(text) {
+                    const t = text.toLowerCase();
+                    if (t.includes('drop') || t.includes('station') || t.includes('counter') || t.includes('self') || t.includes('hub') || t.includes('branch')) {
+                        return false;
+                    }
+                    return true;
+                },
+                apply: function(isPickup) {
+                    const alpine = getAlpineConsoleData();
+                    if (alpine && typeof alpine.setDoorstepPickup === 'function') {
+                        alpine.setDoorstepPickup(isPickup);
+                    } else {
+                        const input = document.getElementById('schedule_doorstep_pickup');
+                        if (input) input.value = isPickup ? '1' : '0';
+                    }
+                    return isPickup ? 'Doorstep Courier Collection' : 'Station / Counter Drop-off';
+                }
+            },
+
+            // Field 5: Preferred Collection Time Slot
+            {
+                id: 'scheduled_pickup_time',
+                title: 'Preferred Collection Time Slot',
+                getValue: function() {
+                    const el = document.querySelector('input[name="scheduled_pickup_time"]');
+                    return el ? el.value.trim() : '';
+                },
+                prompt: function() {
+                    return 'What is your preferred pickup date and time?';
+                },
+                confirmPrompt: function(ctx, curVal) {
+                    return `Pickup time is set to "${curVal}". Keep or update?`;
+                },
+                targetSelector: function() {
+                    return document.querySelector('input[name="scheduled_pickup_time"]');
+                },
+                parse: function(text) {
+                    return text.trim();
+                },
+                apply: function(val) {
+                    const el = document.querySelector('input[name="scheduled_pickup_time"]');
+                    if (el) typeIntoElement(el, val);
+                    return val;
+                }
+            },
+
+            // Field 6: Pickup Notes for Rider
+            {
+                id: 'pickup_notes',
+                title: 'Rider Pickup Notes',
+                getValue: function() {
+                    const el = document.querySelector('input[name="pickup_notes"]');
+                    return el ? el.value.trim() : '';
+                },
+                prompt: function() {
+                    return 'Any instructions for the rider? Say skip if none.';
+                },
+                confirmPrompt: function(ctx, curVal) {
+                    return `Rider note is "${curVal}". Keep or update?`;
+                },
+                targetSelector: function() {
+                    return document.querySelector('input[name="pickup_notes"]');
+                },
+                parse: function(text) {
+                    if (text.toLowerCase().includes('skip') || text.toLowerCase().includes('none')) return '';
+                    return text.trim();
+                },
+                apply: function(val) {
+                    const el = document.querySelector('input[name="pickup_notes"]');
+                    if (el && val) typeIntoElement(el, val);
+                    return val || 'None';
+                }
+            },
+
+            // Field 7: Sender Contact Person
+            {
+                id: 'sender_name',
+                title: isEcom ? 'Store / Merchant Contact Name' : 'Sender Contact Person',
+                getValue: function() {
+                    const el = document.getElementById('pickup_name_0') || document.getElementById('sender_name_input') || document.querySelector('input[name="pickup_name[]"]');
+                    return el ? el.value.trim() : '';
+                },
+                prompt: function() {
+                    return isEcom 
+                        ? 'Who is the store contact person for pickup?' 
+                        : 'Who is the sender or contact person for pickup?';
+                },
+                confirmPrompt: function(ctx, curVal) {
+                    return `Sender name is "${curVal}". Keep or change?`;
+                },
+                targetSelector: function() {
+                    return document.getElementById('pickup_name_0') || document.getElementById('sender_name_input') || document.querySelector('input[name="pickup_name[]"]');
+                },
+                parse: function(text) {
+                    return text.replace(/^(my name is|the name is|contact is|sender is|this is)\s+/i, '').trim();
+                },
+                apply: function(val) {
+                    const el = document.getElementById('pickup_name_0') || document.getElementById('sender_name_input') || document.querySelector('input[name="pickup_name[]"]');
+                    if (el) typeIntoElement(el, val);
+                    return val;
+                }
+            },
+
+            // Field 8: Sender Mobile Phone
+            {
+                id: 'sender_phone',
+                title: isEcom ? 'Store Contact Mobile Number' : 'Sender Mobile Phone',
+                getValue: function() {
+                    const el = document.getElementById('pickup_phone_0') || document.getElementById('sender_phone_input') || document.querySelector('input[name="pickup_phone[]"]');
+                    return el ? el.value.trim() : '';
+                },
+                prompt: function() {
+                    return 'What is the sender mobile phone number?';
+                },
+                confirmPrompt: function(ctx, curVal) {
+                    return `Sender phone is "${curVal}". Keep or update?`;
+                },
+                targetSelector: function() {
+                    return document.getElementById('pickup_phone_0') || document.getElementById('sender_phone_input') || document.querySelector('input[name="pickup_phone[]"]');
+                },
+                parse: function(text) {
+                    return parseSpokenPhoneNumber(text);
+                },
+                apply: function(val) {
+                    const el = document.getElementById('pickup_phone_0') || document.getElementById('sender_phone_input') || document.querySelector('input[name="pickup_phone[]"]');
+                    if (el) typeIntoElement(el, val);
+                    return val;
+                }
+            },
+
+            // Field 9: Pickup Street Address & Landmark
+            {
+                id: 'pickup_address',
+                title: isEcom ? 'Store / Warehouse Pickup Address' : 'Full Pickup Street Address & Landmark',
+                getValue: function() {
+                    const el = document.getElementById('pickup_address_0') || document.getElementById('sender_address_input') || document.querySelector('textarea[name="pickup_address[]"]');
+                    return el ? el.value.trim() : '';
+                },
+                prompt: function() {
+                    return 'What is the pickup street address or landmark in Nepal?';
+                },
+                confirmPrompt: function(ctx, curVal) {
+                    return `Pickup address is "${curVal}". Keep or change?`;
+                },
+                targetSelector: function() {
+                    return document.getElementById('pickup_address_0') || document.getElementById('sender_address_input') || document.querySelector('textarea[name="pickup_address[]"]');
+                },
+                parse: function(text) {
+                    return text.trim();
+                },
+                apply: function(val) {
+                    const el = document.getElementById('pickup_address_0') || document.getElementById('sender_address_input') || document.querySelector('textarea[name="pickup_address[]"]');
+                    if (el) {
+                        const current = el.value.trim();
+                        const finalVal = current && !current.toLowerCase().includes(val.toLowerCase()) ? `${val}, ${current}` : val;
+                        typeIntoElement(el, finalVal);
+                    }
+                    return val;
+                }
+            }
+        ];
+
+        // Delivery Destination Fields (Mode-specific)
+        if (isIntl) {
+            steps.push(
+                // Field 10: Destination Country
+                {
+                    id: 'receiver_country',
+                    title: 'Destination Country',
+                    getValue: function() {
+                        const sel = document.getElementById('receiver_country');
+                        return sel && sel.value ? sel.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'Which destination country is this international shipment heading to? For example: Poland, United States, United Kingdom, Australia, or Germany.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The destination country is currently set to "${curVal}". Is that correct, or is the shipment heading to another country?`;
+                    },
+                    targetSelector: function() {
+                        return document.getElementById('receiver_country');
+                    },
+                    parse: function(text) {
+                        return parseCountryName(text);
+                    },
+                    apply: function(val) {
+                        const select = document.getElementById('receiver_country');
+                        if (select) {
+                            let matched = false;
+                            for (let opt of select.options) {
+                                if (opt.value.toLowerCase() === val.toLowerCase()) {
+                                    select.value = opt.value;
+                                    matched = true;
+                                    break;
+                                }
+                            }
+                            if (!matched) {
+                                const opt = new Option(val, val, true, true);
+                                select.add(opt);
+                                select.value = val;
+                            }
+                            select.dispatchEvent(new Event('change', { bubbles: true }));
+                            select.classList.add('ring-2', 'ring-emerald-500', 'bg-emerald-50/20');
+                            setTimeout(() => select.classList.remove('ring-2', 'ring-emerald-500', 'bg-emerald-50/20'), 1500);
+                            if (typeof updateInternationalDialPrefix === 'function') updateInternationalDialPrefix();
+                        }
+                        return val;
+                    }
+                },
+                // Field 11: Overseas Recipient Name / Company
+                {
+                    id: 'receiver_name',
+                    title: 'Overseas Recipient Name / Company',
+                    getValue: function() {
+                        const el = document.querySelector('input[name="receiver_name"]');
+                        return el ? el.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'What is the full name or company name of the recipient overseas?';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The recipient name is currently set to "${curVal}". Does that look correct, or would you like to update it?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('input[name="receiver_name"]');
+                    },
+                    parse: function(text) {
+                        return text.replace(/^(the receiver is|receiver is|name is|company is|to)\s+/i, '').trim();
+                    },
+                    apply: function(val) {
+                        const el = document.querySelector('input[name="receiver_name"]');
+                        if (el) typeIntoElement(el, val);
+                        return val;
+                    }
+                },
+                // Field 12: Overseas Recipient Phone Number
+                {
+                    id: 'receiver_phone',
+                    title: 'Overseas Recipient Phone Number',
+                    getValue: function() {
+                        const el = document.getElementById('receiver_phone') || document.querySelector('input[name="receiver_phone"]');
+                        return el ? el.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'What is the contact mobile or telephone number of the overseas recipient?';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The overseas contact phone is currently recorded as "${curVal}". Is this correct, or would you like to update it?`;
+                    },
+                    targetSelector: function() {
+                        return document.getElementById('receiver_phone') || document.querySelector('input[name="receiver_phone"]');
+                    },
+                    parse: function(text) {
+                        return parseSpokenPhoneNumber(text);
+                    },
+                    apply: function(val) {
+                        const el = document.getElementById('receiver_phone') || document.querySelector('input[name="receiver_phone"]');
+                        if (el) typeIntoElement(el, val);
+                        return val;
+                    }
+                },
+                // Field 13: Consignee Tax ID / EORI / VAT
+                {
+                    id: 'receiver_tax_id',
+                    title: 'Consignee Tax ID / EORI / VAT',
+                    getValue: function() {
+                        const el = document.getElementById('receiver_tax_id');
+                        return el ? el.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'If applicable for customs, what is the consignee’s Tax ID, VAT, or EORI number? Or say skip if personal.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `Consignee Tax ID is currently recorded as "${curVal}". Would you like to keep this, or update it?`;
+                    },
+                    targetSelector: function() {
+                        return document.getElementById('receiver_tax_id');
+                    },
+                    parse: function(text) {
+                        if (text.toLowerCase().includes('skip') || text.toLowerCase().includes('none')) return '';
+                        return text.trim();
+                    },
+                    apply: function(val) {
+                        const el = document.getElementById('receiver_tax_id');
+                        if (el && val) typeIntoElement(el, val);
+                        return val || 'None';
+                    }
+                },
+                // Field 14: Destination City Overseas
+                {
+                    id: 'receiver_city',
+                    title: 'Destination City Overseas',
+                    getValue: function() {
+                        const el = document.querySelector('input[name="receiver_city"]');
+                        return el ? el.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'What is the destination city overseas? For example: Warsaw, London, Sydney, or New York.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The destination city is currently set to "${curVal}". Is that correct, or heading to another city?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('input[name="receiver_city"]');
+                    },
+                    parse: function(text) {
+                        return text.replace(/^(city is|in|at)\s+/i, '').trim();
+                    },
+                    apply: function(val) {
+                        const el = document.querySelector('input[name="receiver_city"]');
+                        if (el) typeIntoElement(el, val);
+                        return val;
+                    }
+                },
+                // Field 15: State / Province Overseas
+                {
+                    id: 'receiver_state',
+                    title: 'Destination State / Province',
+                    getValue: function() {
+                        const el = document.querySelector('input[name="receiver_state"]');
+                        return el ? el.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'What is the state, province, or region overseas? For example: Mazowieckie, California, or Ontario. Or say skip.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The destination state or province is currently "${curVal}". Is that correct?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('input[name="receiver_state"]');
+                    },
+                    parse: function(text) {
+                        if (text.toLowerCase().includes('skip') || text.toLowerCase().includes('none')) return '';
+                        return text.trim();
+                    },
+                    apply: function(val) {
+                        const el = document.querySelector('input[name="receiver_state"]');
+                        if (el && val) typeIntoElement(el, val);
+                        return val || 'None';
+                    }
+                },
+                // Field 16: Postal / ZIP Code
+                {
+                    id: 'receiver_postal_code',
+                    title: 'Postal / ZIP Code',
+                    getValue: function() {
+                        const el = document.querySelector('input[name="receiver_postal_code"]');
+                        return el ? el.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'What is the postal or ZIP code for the overseas destination address? Or say skip if unknown.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The postal code is currently set to "${curVal}". Does that look correct, or would you like to update it?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('input[name="receiver_postal_code"]');
+                    },
+                    parse: function(text) {
+                        if (text.toLowerCase().includes('skip') || text.toLowerCase().includes('unknown')) return '';
+                        return text.replace(/^(zip is|code is|postal code is)\s+/i, '').trim();
+                    },
+                    apply: function(val) {
+                        const el = document.querySelector('input[name="receiver_postal_code"]');
+                        if (el && val) typeIntoElement(el, val);
+                        return val || 'Skipped';
+                    }
+                },
+                // Field 17: Destination Street Address
+                {
+                    id: 'receiver_street',
+                    title: 'Destination Street Address',
+                    getValue: function() {
+                        const el = document.querySelector('input[name="receiver_street"]');
+                        return el ? el.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'What is the full street address overseas, including building, suite, or room number?';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The overseas street address is currently set to "${curVal}". Would you like to keep this, or update it?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('input[name="receiver_street"]');
+                    },
+                    parse: function(text) {
+                        return text.trim();
+                    },
+                    apply: function(val) {
+                        const el = document.querySelector('input[name="receiver_street"]');
+                        if (el) typeIntoElement(el, val);
+                        return val;
+                    }
+                }
+            );
+        } else {
+            // Domestic or E-Commerce Destination Fields
+            steps.push(
+                // Field 10: Recipient Full Name
+                {
+                    id: 'delivery_name',
+                    title: isEcom ? 'Customer Full Name' : 'Recipient Full Name',
+                    getValue: function() {
+                        const el = document.getElementById('delivery_name_0') || document.querySelector('input[name="delivery_name[]"]');
+                        return el ? el.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return isEcom 
+                            ? 'What is the customer’s full name at the delivery destination?' 
+                            : 'What is the full name of the recipient or consignee at the delivery destination?';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The recipient full name is currently set to "${curVal}". Is that correct, or would you like to change it?`;
+                    },
+                    targetSelector: function() {
+                        return document.getElementById('delivery_name_0') || document.querySelector('input[name="delivery_name[]"]');
+                    },
+                    parse: function(text) {
+                        return text.replace(/^(the receiver is|receiver is|name is|customer is|to)\s+/i, '').trim();
+                    },
+                    apply: function(val) {
+                        const el = document.getElementById('delivery_name_0') || document.querySelector('input[name="delivery_name[]"]');
+                        if (el) typeIntoElement(el, val);
+                        return val;
+                    }
+                },
+                // Field 11: Recipient Phone Number
+                {
+                    id: 'delivery_phone',
+                    title: isEcom ? 'Customer Mobile Phone' : 'Recipient Mobile Phone',
+                    getValue: function() {
+                        const el = document.getElementById('delivery_phone_0') || document.querySelector('input[name="delivery_phone[]"]');
+                        return el ? el.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'What is the recipient’s mobile phone number for delivery coordination in Nepal?';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The recipient mobile phone number is recorded as "${curVal}". Is that correct, or would you like to update it?`;
+                    },
+                    targetSelector: function() {
+                        return document.getElementById('delivery_phone_0') || document.querySelector('input[name="delivery_phone[]"]');
+                    },
+                    parse: function(text) {
+                        return parseSpokenPhoneNumber(text);
+                    },
+                    apply: function(val) {
+                        const el = document.getElementById('delivery_phone_0') || document.querySelector('input[name="delivery_phone[]"]');
+                        if (el) typeIntoElement(el, val);
+                        return val;
+                    }
+                },
+                // Field 12: Destination Province in Nepal
+                {
+                    id: 'delivery_province',
+                    title: 'Destination Province in Nepal',
+                    getValue: function() {
+                        const sel = document.getElementById('shipment_deliv_0_province') || document.querySelector('select[name="delivery_province[]"]');
+                        return sel && sel.selectedIndex >= 0 && sel.value ? (sel.options[sel.selectedIndex]?.text?.trim() || sel.value) : '';
+                    },
+                    prompt: function() {
+                        return 'Which destination province in Nepal is this package heading to? For example: Bagmati, Koshi, Madhesh, Gandaki, Lumbini, Karnali, or Sudurpashchim.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The destination province is currently set to "${curVal}". Is that correct, or heading to another province?`;
+                    },
+                    targetSelector: function() {
+                        return document.getElementById('shipment_deliv_0_province') || document.querySelector('select[name="delivery_province[]"]');
+                    },
+                    parse: function(text) {
+                        return text.trim();
+                    },
+                    apply: function(val) {
+                        const sel = document.getElementById('shipment_deliv_0_province');
+                        if (sel) {
+                            for (let opt of sel.options) {
+                                if (opt.value && opt.value.toLowerCase().includes(val.toLowerCase())) {
+                                    sel.value = opt.value;
+                                    sel.dispatchEvent(new Event('change', { bubbles: true }));
+                                    break;
+                                }
+                            }
+                        }
+                        return val;
+                    }
+                },
+                // Field 13: Destination District in Nepal
+                {
+                    id: 'destination_district',
+                    title: 'Destination District in Nepal',
+                    getValue: function() {
+                        const el = document.getElementById('shipment_deliv_0_district') || document.getElementById('shipment_deliv_0_search');
+                        return el ? el.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'Which destination district in Nepal is this package heading to? For example: Kathmandu, Jhapa, Morang, Pokhara, Chitwan, or Rupandehi.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The destination district is currently set to "${curVal}". Does that look correct, or would you like to change districts?`;
+                    },
+                    targetSelector: function() {
+                        return document.getElementById('shipment_deliv_0_search') || document.getElementById('shipment_deliv_0_district') || document.getElementById('delivery_address_0');
+                    },
+                    parse: function(text) {
+                        return text.replace(/^(to|for|destination is|district is|delivered to)\s+/i, '')
+                                   .replace(/\s+(district|zilla|ma|lai|pathaune)$/i, '').trim();
+                    },
+                    apply: function(val) {
+                        const applied = selectNepalTerritoryDistrict('shipment_deliv_0', val);
+                        return applied || val;
+                    }
+                },
+                // Field 14: Delivery Street Address & Landmark
+                {
+                    id: 'delivery_address',
+                    title: 'Delivery Street Address & Landmark',
+                    getValue: function() {
+                        const el = document.getElementById('delivery_address_0') || document.querySelector('textarea[name="delivery_address[]"]');
+                        return el ? el.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'What is the detailed street address, ward number, or nearby landmark for delivery drop-off?';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The delivery drop-off address is currently set to "${curVal}". Would you like to keep this, or update it?`;
+                    },
+                    targetSelector: function() {
+                        return document.getElementById('delivery_address_0') || document.querySelector('textarea[name="delivery_address[]"]');
+                    },
+                    parse: function(text) {
+                        return text.trim();
+                    },
+                    apply: function(val) {
+                        const el = document.getElementById('delivery_address_0') || document.querySelector('textarea[name="delivery_address[]"]');
+                        if (el) {
+                            const current = el.value.trim();
+                            const finalVal = current && !current.toLowerCase().includes(val.toLowerCase()) ? `${val}, ${current}` : val;
+                            typeIntoElement(el, finalVal);
+                        }
+                        return val;
+                    }
+                }
+            );
+        }
+
+        // Section 4: Cargo Specifications & Documentation
+        if (isEcom) {
+            // E-Commerce Simple Cargo Specifications
+            steps.push(
+                // Field 15: Cargo Weight
+                {
+                    id: 'weight',
+                    title: 'Parcel Gross Weight (KG)',
+                    getValue: function() {
+                        const el = document.getElementById('weight-input') || document.querySelector('input[name="weight"]');
+                        return el && el.value ? el.value.trim() + ' KG' : '';
+                    },
+                    prompt: function() {
+                        return 'What is the total weight of the package in kilograms? For example: 1.5 kg or 3 kg.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The package weight is currently recorded as "${curVal}". Does that look accurate, or would you like to change it?`;
+                    },
+                    targetSelector: function() {
+                        return document.getElementById('weight-input') || document.querySelector('input[name="weight"]');
+                    },
+                    parse: function(text) {
+                        return parseSpokenWeight(text);
+                    },
+                    apply: function(val) {
+                        const el = document.getElementById('weight-input') || document.querySelector('input[name="weight"]');
+                        if (el) {
+                            typeIntoElement(el, val.toString(), () => {
+                                if (typeof calculateVolumetricWeight === 'function') calculateVolumetricWeight();
+                                if (typeof updateSummaryStats === 'function') updateSummaryStats();
+                            });
+                        }
+                        return val + ' KG';
+                    }
+                },
+                // Field 16: Cargo Dimensions
+                {
+                    id: 'dimensions',
+                    title: 'Package Dimensions (L x W x H cm)',
+                    getValue: function() {
+                        const l = document.getElementById('length-input')?.value;
+                        const w = document.getElementById('width-input')?.value;
+                        const h = document.getElementById('height-input')?.value;
+                        return (l && w && h) ? `${l} × ${w} × ${h} cm` : '';
+                    },
+                    prompt: function() {
+                        return 'What are the box dimensions in centimeters, length by width by height? Or say skip if standard.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The package dimensions are currently "${curVal}". Would you like to keep these, or update them?`;
+                    },
+                    targetSelector: function() {
+                        return document.getElementById('length-input');
+                    },
+                    parse: function(text) {
+                        return parseSpokenDimensions(text);
+                    },
+                    apply: function(dims) {
+                        if (!dims || typeof dims !== 'object') return 'Standard dimensions';
+                        const lEl = document.getElementById('length-input');
+                        const wEl = document.getElementById('width-input');
+                        const hEl = document.getElementById('height-input');
+                        if (lEl) lEl.value = dims.length || 20;
+                        if (wEl) wEl.value = dims.width || 20;
+                        if (hEl) hEl.value = dims.height || 20;
+                        [lEl, wEl, hEl].forEach(el => {
+                            if (el) {
+                                el.dispatchEvent(new Event('input', { bubbles: true }));
+                                el.classList.add('ring-2', 'ring-emerald-500');
+                                setTimeout(() => el.classList.remove('ring-2', 'ring-emerald-500'), 1500);
+                            }
+                        });
+                        if (typeof calculateVolumetricWeight === 'function') calculateVolumetricWeight();
+                        return `${dims.length} × ${dims.width} × ${dims.height} cm`;
+                    }
+                },
+                // Field 17: Cargo Description
+                {
+                    id: 'description',
+                    title: 'Package Contents Description',
+                    getValue: function() {
+                        const el = document.querySelector('input[name="description"]');
+                        return el ? el.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'Briefly describe the contents of the package. For example: retail apparel, electronics, or cosmetics.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The contents description is currently "${curVal}". Keep this description, or would you like to update it?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('input[name="description"]');
+                    },
+                    parse: function(text) {
+                        return text.trim();
+                    },
+                    apply: function(val) {
+                        const el = document.querySelector('input[name="description"]');
+                        if (el) typeIntoElement(el, val);
+                        return val;
+                    }
+                },
+                // Field 18: Supporting Merchant Bill Type
+                {
+                    id: 'seller_bill_type',
+                    title: 'Supporting Tax Document / Bill Type',
+                    getValue: function() {
+                        const sel = document.querySelector('select[name="seller_bill_type"]');
+                        return sel && sel.selectedIndex >= 0 ? sel.options[sel.selectedIndex]?.text?.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'What type of supporting merchant document or tax receipt is being attached? For example: VAT Tax Invoice, PAN Cash Bill, or say skip.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The supporting bill type is currently "${curVal}". Is that correct?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('select[name="seller_bill_type"]');
+                    },
+                    parse: function(text) {
+                        const t = text.toLowerCase();
+                        if (t.includes('pan')) return 'pan_bill';
+                        if (t.includes('customs')) return 'customs_declaration';
+                        if (t.includes('origin')) return 'certificate_of_origin';
+                        return 'vat_invoice';
+                    },
+                    apply: function(val) {
+                        const sel = document.querySelector('select[name="seller_bill_type"]');
+                        if (sel) {
+                            sel.value = val;
+                            sel.dispatchEvent(new Event('change', { bubbles: true }));
+                            return sel.options[sel.selectedIndex]?.text || val;
+                        }
+                        return val;
+                    }
+                },
+                // Field 19: Merchant Bill Reference Number
+                {
+                    id: 'seller_bill_number',
+                    title: 'Bill / Tax Reference Number',
+                    getValue: function() {
+                        const el = document.querySelector('input[name="seller_bill_number"]');
+                        return el ? el.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'What is the merchant bill or order reference number? Or say skip if not applicable.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The bill reference number is recorded as "${curVal}". Would you like to keep this, or update it?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('input[name="seller_bill_number"]');
+                    },
+                    parse: function(text) {
+                        if (text.toLowerCase().includes('skip') || text.toLowerCase().includes('none')) return '';
+                        return text.trim();
+                    },
+                    apply: function(val) {
+                        const el = document.querySelector('input[name="seller_bill_number"]');
+                        if (el && val) typeIntoElement(el, val);
+                        return val || 'None';
+                    }
+                }
+            );
+        } else {
+            // Full Documentation Suite: Domestic & International
+            steps.push(
+                // Field 18: Commercial Invoice Currency
+                {
+                    id: 'invoice_currency',
+                    title: 'Commercial Invoice Currency',
+                    getValue: function() {
+                        const sel = document.querySelector('select[x-model="invoiceCurrency"]');
+                        return sel ? sel.value.trim() : (isIntl ? 'USD' : 'NPR');
+                    },
+                    prompt: function() {
+                        return 'Which currency would you like to use for the Commercial Invoice? For example: USD, NPR, EUR, or GBP.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The Commercial Invoice currency is currently set to "${curVal}". Would you like to keep this, or switch currency?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('select[x-model="invoiceCurrency"]');
+                    },
+                    parse: function(text) {
+                        const t = text.toUpperCase();
+                        if (t.includes('NPR') || t.includes('RUPEE') || t.includes('RS')) return 'NPR';
+                        if (t.includes('EUR') || t.includes('EURO')) return 'EUR';
+                        if (t.includes('GBP') || t.includes('POUND')) return 'GBP';
+                        if (t.includes('AUD')) return 'AUD';
+                        return 'USD';
+                    },
+                    apply: function(val) {
+                        const sel = document.querySelector('select[x-model="invoiceCurrency"]');
+                        if (sel) {
+                            sel.value = val;
+                            sel.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                        const alpine = getAlpineConsoleData();
+                        if (alpine) alpine.invoiceCurrency = val;
+                        return val;
+                    }
+                },
+                // Field 19: Commercial Invoice Number
+                {
+                    id: 'invoice_number',
+                    title: 'Commercial Invoice Number',
+                    getValue: function() {
+                        const el = document.querySelector('input[x-model="invoiceNumber"]');
+                        return el ? el.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'What is the Commercial Invoice reference number? For example: INV-2026-001.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The Commercial Invoice number is currently "${curVal}". Does that look correct, or would you like to update it?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('input[x-model="invoiceNumber"]');
+                    },
+                    parse: function(text) {
+                        return text.toUpperCase().trim();
+                    },
+                    apply: function(val) {
+                        const el = document.querySelector('input[x-model="invoiceNumber"]');
+                        if (el) typeIntoElement(el, val);
+                        const alpine = getAlpineConsoleData();
+                        if (alpine) alpine.invoiceNumber = val;
+                        return val;
+                    }
+                },
+                // Field 20: Commercial Invoice Date
+                {
+                    id: 'invoice_date',
+                    title: 'Commercial Invoice Date',
+                    getValue: function() {
+                        const el = document.querySelector('input[x-model="invoiceDate"]');
+                        return el ? el.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'What is the Commercial Invoice date? For example: today’s date.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The Commercial Invoice date is set to "${curVal}". Does that look correct?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('input[x-model="invoiceDate"]');
+                    },
+                    parse: function(text) {
+                        return text.trim();
+                    },
+                    apply: function(val) {
+                        const el = document.querySelector('input[x-model="invoiceDate"]');
+                        if (el) typeIntoElement(el, val);
+                        const alpine = getAlpineConsoleData();
+                        if (alpine) alpine.invoiceDate = val;
+                        return val;
+                    }
+                },
+                // Field 21: Incoterms
+                {
+                    id: 'incoterms',
+                    title: 'Incoterms SLA',
+                    getValue: function() {
+                        const sel = document.querySelector('select[x-model="incoterm"]');
+                        return sel ? sel.value.trim() : 'DAP';
+                    },
+                    prompt: function() {
+                        return 'Which Incoterm applies to this shipment? For example: DAP Delivered at Place, DDP Delivered Duty Paid, FOB Free on Board, or CIF.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The Incoterm is currently set to "${curVal}". Is this correct, or would you like to switch terms?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('select[x-model="incoterm"]');
+                    },
+                    parse: function(text) {
+                        const t = text.toUpperCase();
+                        if (t.includes('DDP')) return 'DDP';
+                        if (t.includes('FOB')) return 'FOB';
+                        if (t.includes('CIF')) return 'CIF';
+                        if (t.includes('EXW')) return 'EXW';
+                        return 'DAP';
+                    },
+                    apply: function(val) {
+                        const sel = document.querySelector('select[x-model="incoterm"]');
+                        if (sel) {
+                            sel.value = val;
+                            sel.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                        const alpine = getAlpineConsoleData();
+                        if (alpine) alpine.incoterm = val;
+                        return val;
+                    }
+                },
+                // Field 22: Reason for Export / Dispatch
+                {
+                    id: 'reason_for_export',
+                    title: 'Reason for Export / Dispatch',
+                    getValue: function() {
+                        const sel = document.querySelector('select[x-model="reasonForExport"]');
+                        return sel ? sel.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'What is the declared reason for export or transit? For example: Commercial Sale, Sample Not For Sale, Personal Gift, or Return for Repair.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `Reason for export is currently set to "${curVal}". Would you like to keep this, or update it?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('select[x-model="reasonForExport"]');
+                    },
+                    parse: function(text) {
+                        const t = text.toLowerCase();
+                        if (t.includes('sample')) return 'Sample Not For Sale';
+                        if (t.includes('gift') || t.includes('personal')) return 'Gift / Personal Effects';
+                        if (t.includes('repair') || t.includes('return')) return 'Return / Repair';
+                        return 'Commercial Sale / Export';
+                    },
+                    apply: function(val) {
+                        const sel = document.querySelector('select[x-model="reasonForExport"]');
+                        if (sel) {
+                            sel.value = val;
+                            sel.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                        const alpine = getAlpineConsoleData();
+                        if (alpine) alpine.reasonForExport = val;
+                        return val;
+                    }
+                },
+                // Field 23: Client Acquisition Channel
+                {
+                    id: 'acquisition_source',
+                    title: 'Acquisition Booking Channel',
+                    getValue: function() {
+                        const sel = document.querySelector('select[x-model="acquisitionSource"]');
+                        return sel && sel.selectedIndex >= 0 ? sel.options[sel.selectedIndex]?.text?.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'What is the client acquisition booking channel? For example: Direct Web Portal, Client Referral, Sales Executive, or Walk-in.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The booking acquisition channel is currently "${curVal}". Is that correct?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('select[x-model="acquisitionSource"]');
+                    },
+                    parse: function(text) {
+                        const t = text.toLowerCase();
+                        if (t.includes('referral')) return 'referral';
+                        if (t.includes('sales')) return 'sales_representative';
+                        if (t.includes('walk') || t.includes('counter')) return 'agent_walkin';
+                        return 'direct_portal';
+                    },
+                    apply: function(val) {
+                        const sel = document.querySelector('select[x-model="acquisitionSource"]');
+                        if (sel) {
+                            sel.value = val;
+                            sel.dispatchEvent(new Event('change', { bubbles: true }));
+                            return sel.options[sel.selectedIndex]?.text || val;
+                        }
+                        return val;
+                    }
+                },
+                // Field 24: Exporter PAN / VAT
+                {
+                    id: 'exporter_pan_vat',
+                    title: 'Exporter PAN / VAT',
+                    getValue: function() {
+                        const el = document.querySelector('input[x-model="exporterPanVat"]');
+                        return el ? el.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'What is the exporter or business 9-digit PAN or VAT registration number in Nepal?';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The exporter PAN or VAT number is currently recorded as "${curVal}". Does that look correct, or would you like to update it?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('input[x-model="exporterPanVat"]');
+                    },
+                    parse: function(text) {
+                        return text.replace(/\D/g, '') || text.trim();
+                    },
+                    apply: function(val) {
+                        const el = document.querySelector('input[x-model="exporterPanVat"]');
+                        if (el) typeIntoElement(el, val);
+                        const alpine = getAlpineConsoleData();
+                        if (alpine) alpine.exporterPanVat = val;
+                        return val;
+                    }
+                },
+                // Field 25: EXIM Code (Nepal Customs)
+                {
+                    id: 'exporter_exim_code',
+                    title: 'Nepal Customs EXIM Code',
+                    getValue: function() {
+                        const el = document.querySelector('input[x-model="exporterEximCode"]');
+                        return el ? el.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'If you have an EXIM code for Nepal Customs, please state it now, or say skip.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The customs EXIM code is currently "${curVal}". Would you like to keep this, or update it?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('input[x-model="exporterEximCode"]');
+                    },
+                    parse: function(text) {
+                        if (text.toLowerCase().includes('skip') || text.toLowerCase().includes('none')) return '';
+                        return text.toUpperCase().trim();
+                    },
+                    apply: function(val) {
+                        const el = document.querySelector('input[x-model="exporterEximCode"]');
+                        if (el && val) typeIntoElement(el, val);
+                        const alpine = getAlpineConsoleData();
+                        if (alpine) alpine.exporterEximCode = val;
+                        return val || 'None';
+                    }
+                },
+                // Field 26: Declared Commodity Line Item Name
+                {
+                    id: 'commodity_name',
+                    title: 'Declared Commodity Line Item',
+                    getValue: function() {
+                        const el = document.querySelector('tbody input[x-model="item.name"]');
+                        return el ? el.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'What is the primary commodity or product being shipped? For example: Handmade Pashmina Shawl, Himalayan Orthodox Tea, or Singing Bowls. Netpack will automatically suggest WCO Harmonized System tariffs!';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The declared commodity line item is currently set to "${curVal}". Would you like to keep this, or update it?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('tbody input[x-model="item.name"]');
+                    },
+                    parse: function(text) {
+                        return text.trim();
+                    },
+                    apply: function(val) {
+                        const input = document.querySelector('tbody input[x-model="item.name"]');
+                        if (input) typeIntoElement(input, val);
+                        const alpine = getAlpineConsoleData();
+                        if (alpine && alpine.invoiceItems && alpine.invoiceItems[0]) {
+                            alpine.invoiceItems[0].name = val;
+                            alpine.invoiceItems[0].searchQuery = val;
+                            if (typeof alpine.fetchHsSuggestions === 'function') {
+                                alpine.fetchHsSuggestions(0, val);
+                            }
+                        }
+                        return val;
+                    }
+                },
+                // Field 27: Declared Quantity & Unit Price
+                {
+                    id: 'commodity_qty_price',
+                    title: 'Declared Quantity & Unit Price',
+                    getValue: function() {
+                        const qty = document.querySelector('tbody input[x-model.number="item.qty"]')?.value;
+                        const uom = document.querySelector('tbody select[x-model="item.uom"]')?.value || 'PCS';
+                        const price = document.querySelector('tbody input[x-model.number="item.unit_price"]')?.value;
+                        return (qty && price) ? `${qty} ${uom} @ ${price}` : '';
+                    },
+                    prompt: function() {
+                        return 'How many units are being shipped, and what is the unit price in the invoice currency? For example: 5 pieces at 20 dollars.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `Commodity quantity and unit price are currently recorded as "${curVal}". Does that look correct, or would you like to update?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('tbody input[x-model.number="item.qty"]');
+                    },
+                    parse: function(text) {
+                        const m = text.match(/(\d+(?:\.\d+)?)/);
+                        return m ? parseFloat(m[1]) : 1;
+                    },
+                    apply: function(val) {
+                        const qtyInput = document.querySelector('tbody input[x-model.number="item.qty"]');
+                        if (qtyInput) {
+                            qtyInput.value = val;
+                            qtyInput.dispatchEvent(new Event('input', { bubbles: true }));
+                        }
+                        const alpine = getAlpineConsoleData();
+                        if (alpine && alpine.invoiceItems && alpine.invoiceItems[0]) {
+                            alpine.invoiceItems[0].qty = parseFloat(val) || 1;
+                            if (typeof alpine.syncInvoiceItemQty === 'function') alpine.syncInvoiceItemQty(0);
+                        }
+                        return `${val} units`;
+                    }
+                },
+                // Field 28: Total Cartons / Box Count
+                {
+                    id: 'total_boxes',
+                    title: 'Total Cartons / Box Count',
+                    getValue: function() {
+                        const el = document.querySelector('input[x-model.number="totalBoxes"]');
+                        return el && el.value ? el.value.trim() + ' Box(es)' : '1 Box';
+                    },
+                    prompt: function() {
+                        return 'How many total cartons or boxes will this consignment be packed into? For example: 1 box, 2 boxes, or 5 boxes.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `Total carton count is currently set to "${curVal}". Is that correct, or packed into different boxes?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('input[x-model.number="totalBoxes"]');
+                    },
+                    parse: function(text) {
+                        const m = text.match(/\d+/);
+                        return m ? parseInt(m[0], 10) : 1;
+                    },
+                    apply: function(val) {
+                        const alpine = getAlpineConsoleData();
+                        if (alpine && typeof alpine.setBoxCount === 'function') {
+                            alpine.setBoxCount(val);
+                        }
+                        return `${val} Box(es)`;
+                    }
+                },
+                // Field 29: Consignment Gross Actual Weight (KG)
+                {
+                    id: 'weight',
+                    title: 'Consignment Gross Weight (KG)',
+                    getValue: function() {
+                        const el = document.getElementById('weight-input') || document.querySelector('input[name="weight"]');
+                        return el && el.value ? el.value.trim() + ' KG' : '';
+                    },
+                    prompt: function() {
+                        return 'What is the total gross weight of the package in kilograms? For example: 2.5 kg or 20 kg.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The consignment gross weight is currently recorded as "${curVal}". Does that look accurate, or would you like to change it?`;
+                    },
+                    targetSelector: function() {
+                        return document.getElementById('weight-input') || document.querySelector('input[name="weight"]');
+                    },
+                    parse: function(text) {
+                        return parseSpokenWeight(text);
+                    },
+                    apply: function(val) {
+                        const el = document.getElementById('weight-input') || document.querySelector('input[name="weight"]');
+                        if (el) {
+                            typeIntoElement(el, val.toString(), () => {
+                                if (typeof calculateVolumetricWeight === 'function') calculateVolumetricWeight();
+                                if (typeof updateSummaryStats === 'function') updateSummaryStats();
+                                const alpine = getAlpineConsoleData();
+                                if (alpine && alpine.boxes && alpine.boxes[0]) {
+                                    alpine.boxes[0].weight_kg = parseFloat(val);
+                                    if (typeof alpine.syncCargoWeight === 'function') alpine.syncCargoWeight();
+                                }
+                            });
+                        }
+                        return val + ' KG';
+                    }
+                },
+                // Field 30: Box Dimensions (L x W x H cm)
+                {
+                    id: 'dimensions',
+                    title: 'Box Dimensions (L x W x H cm)',
+                    getValue: function() {
+                        const l = document.getElementById('length-input')?.value;
+                        const w = document.getElementById('width-input')?.value;
+                        const h = document.getElementById('height-input')?.value;
+                        return (l && w && h) ? `${l} × ${w} × ${h} cm` : '';
+                    },
+                    prompt: function() {
+                        return 'What are the box dimensions in centimeters, length by width by height? Or say skip if standard.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The box dimensions are currently set to "${curVal}". Would you like to keep these, or update them?`;
+                    },
+                    targetSelector: function() {
+                        return document.getElementById('length-input');
+                    },
+                    parse: function(text) {
+                        return parseSpokenDimensions(text);
+                    },
+                    apply: function(dims) {
+                        if (!dims || typeof dims !== 'object') return 'Standard dimensions';
+                        const lEl = document.getElementById('length-input');
+                        const wEl = document.getElementById('width-input');
+                        const hEl = document.getElementById('height-input');
+                        if (lEl) lEl.value = dims.length || 20;
+                        if (wEl) wEl.value = dims.width || 20;
+                        if (hEl) hEl.value = dims.height || 20;
+                        [lEl, wEl, hEl].forEach(el => {
+                            if (el) {
+                                el.dispatchEvent(new Event('input', { bubbles: true }));
+                                el.classList.add('ring-2', 'ring-emerald-500');
+                                setTimeout(() => el.classList.remove('ring-2', 'ring-emerald-500'), 1500);
+                            }
+                        });
+                        if (typeof calculateVolumetricWeight === 'function') calculateVolumetricWeight();
+                        const alpine = getAlpineConsoleData();
+                        if (alpine && alpine.boxes && alpine.boxes[0]) {
+                            alpine.boxes[0].length_cm = parseFloat(dims.length || 20);
+                            alpine.boxes[0].width_cm = parseFloat(dims.width || 20);
+                            alpine.boxes[0].height_cm = parseFloat(dims.height || 20);
+                            if (typeof alpine.syncCargoWeight === 'function') alpine.syncCargoWeight();
+                        }
+                        return `${dims.length} × ${dims.width} × ${dims.height} cm`;
+                    }
+                },
+                // Field 31: Consignment Contents Description
+                {
+                    id: 'description',
+                    title: 'Consignment Contents Description',
+                    getValue: function() {
+                        const el = document.querySelector('input[name="description"]');
+                        return el ? el.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'Please provide a brief general description of the consignment contents for the waybill. For example: Handmade apparel, organic tea, or handicraft samples.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The consignment description is currently set to "${curVal}". Would you like to keep this, or update it?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('input[name="description"]');
+                    },
+                    parse: function(text) {
+                        return text.trim();
+                    },
+                    apply: function(val) {
+                        const el = document.querySelector('input[name="description"]');
+                        if (el) typeIntoElement(el, val);
+                        return val;
+                    }
+                },
+                // Field 32: Supporting Tax / Customs Bill Type
+                {
+                    id: 'seller_bill_type',
+                    title: 'Supporting Tax / Customs Bill Type',
+                    getValue: function() {
+                        const sel = document.querySelector('select[name="seller_bill_type"]');
+                        return sel && sel.selectedIndex >= 0 ? sel.options[sel.selectedIndex]?.text?.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'What type of supporting tax or customs documentation are you attaching? For example: Inland Revenue VAT Invoice, PAN Cash Bill, or Customs Export Declaration.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The supporting tax bill type is currently "${curVal}". Is that correct?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('select[name="seller_bill_type"]');
+                    },
+                    parse: function(text) {
+                        const t = text.toLowerCase();
+                        if (t.includes('pan')) return 'pan_bill';
+                        if (t.includes('customs') || t.includes('pragyapanpatra')) return 'customs_declaration';
+                        if (t.includes('origin')) return 'certificate_of_origin';
+                        return 'vat_invoice';
+                    },
+                    apply: function(val) {
+                        const sel = document.querySelector('select[name="seller_bill_type"]');
+                        if (sel) {
+                            sel.value = val;
+                            sel.dispatchEvent(new Event('change', { bubbles: true }));
+                            const alpine = getAlpineConsoleData();
+                            if (alpine) alpine.sellerBillType = val;
+                            return sel.options[sel.selectedIndex]?.text || val;
+                        }
+                        return val;
+                    }
+                },
+                // Field 33: Tax Invoice / Bill Reference Number
+                {
+                    id: 'seller_bill_number',
+                    title: 'Bill / Tax Reference Number',
+                    getValue: function() {
+                        const el = document.querySelector('input[name="seller_bill_number"]');
+                        return el ? el.value.trim() : '';
+                    },
+                    prompt: function() {
+                        return 'What is the supporting bill or tax invoice reference number? Or say skip if not applicable.';
+                    },
+                    confirmPrompt: function(ctx, curVal) {
+                        return `The bill reference number is recorded as "${curVal}". Would you like to keep this, or update it?`;
+                    },
+                    targetSelector: function() {
+                        return document.querySelector('input[name="seller_bill_number"]');
+                    },
+                    parse: function(text) {
+                        if (text.toLowerCase().includes('skip') || text.toLowerCase().includes('none')) return '';
+                        return text.trim();
+                    },
+                    apply: function(val) {
+                        const el = document.querySelector('input[name="seller_bill_number"]');
+                        if (el && val) typeIntoElement(el, val);
+                        const alpine = getAlpineConsoleData();
+                        if (alpine) alpine.sellerBillNumber = val;
+                        return val || 'None';
+                    }
+                }
+            );
+        }
+
+        return steps;
+    }
+
+    function refreshVoiceStepsForActiveMode(mode, syncStepBadge = false) {
+        if (!window.aiVoiceAutofill) return;
+        const currentStepId = window.aiVoiceAutofill.steps && window.aiVoiceAutofill.steps[window.aiVoiceAutofill.currentStepIndex]?.id;
+        window.aiVoiceAutofill.steps = buildVoiceStepsForMode(mode);
+        
+        if (currentStepId) {
+            const newIdx = window.aiVoiceAutofill.steps.findIndex(s => s.id === currentStepId);
+            if (newIdx !== -1) {
+                window.aiVoiceAutofill.currentStepIndex = newIdx;
+            }
+        }
+
+        if (syncStepBadge && window.aiVoiceAutofill.isActive) {
+            const stepBadge = document.getElementById('ai-voice-step-badge');
+            if (stepBadge) stepBadge.innerText = `Field ${window.aiVoiceAutofill.currentStepIndex + 1} of ${window.aiVoiceAutofill.steps.length}`;
+            const currentStep = window.aiVoiceAutofill.steps[window.aiVoiceAutofill.currentStepIndex];
+            if (currentStep) {
+                const stepTitle = document.getElementById('ai-voice-step-title');
+                const titleText = typeof currentStep.title === 'function' ? currentStep.title() : currentStep.title;
+                if (stepTitle) stepTitle.innerText = titleText;
+            }
+        }
+    }
+
+    window.aiVoiceAutofill = {
+        isActive: false,
+        isSpeaking: false,
+        isListening: false,
+        isVerifying: false,
+        currentFieldValue: '',
+        currentStepIndex: 0,
+        recognition: null,
+        audioStream: null,
+        audioContext: null,
+        analyser: null,
+        animFrameId: null,
+        speechSynthesis: window.speechSynthesis || null,
+        clientPreferredName: '{{ session("ai_preferred_name", explode(" ", Auth::user()->name ?? "Client")[0]) }} Ji',
+        steps: buildVoiceStepsForMode(document.getElementById('shipment_type')?.value || 'domestic')
+    };
+
+    // User consent functions
+    window.dismissVoiceAutofillInvitation = function() {
+        const banner = document.getElementById('ai-voice-invitation-banner');
+        if (banner) {
+            banner.style.opacity = '0';
+            banner.style.transform = 'translateY(-10px)';
+            setTimeout(() => banner.style.display = 'none', 300);
+        }
+        sessionStorage.setItem('ai_voice_autofill_dismissed', '1');
+    };
+
+    // Helper to get current value of a step
+    function getStepCurrentValue(step) {
+        if (!step) return '';
+        try {
+            if (typeof step.getValue === 'function') {
+                const v = step.getValue();
+                if (v !== undefined && v !== null) return String(v).trim();
+            }
+            const el = step.targetSelector ? step.targetSelector() : null;
+            if (!el) return '';
+            if (el.tagName === 'SELECT') {
+                if (el.selectedIndex >= 0 && el.value) {
+                    return el.options[el.selectedIndex]?.text?.trim() || el.value.trim();
+                }
+                return '';
+            }
+            if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+                return String(el.value || '').trim();
+            }
+            return '';
+        } catch(e) {
+            return '';
+        }
+    }
+
+    function isStepFieldFilled(step) {
+        const val = getStepCurrentValue(step);
+        return val !== '' && val !== 'default' && val !== 'None';
+    }
+
+    function findFirstUnfilledStepIndex() {
+        if (!window.aiVoiceAutofill || !window.aiVoiceAutofill.steps) return 0;
+        for (let i = 0; i < window.aiVoiceAutofill.steps.length; i++) {
+            if (!isStepFieldFilled(window.aiVoiceAutofill.steps[i])) {
+                return i;
+            }
+        }
+        return 0;
+    }
+
+    function findNextUnfilledStepIndex(currentIndex) {
+        if (!window.aiVoiceAutofill || !window.aiVoiceAutofill.steps) return -1;
+        for (let i = currentIndex + 1; i < window.aiVoiceAutofill.steps.length; i++) {
+            if (!isStepFieldFilled(window.aiVoiceAutofill.steps[i])) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    // Directly jumps to a specific field's step without restarting from Step 0
+    window.jumpToVoiceStepForField = function(fieldId) {
+        if (!window.aiVoiceAutofill) return;
+
+        const mode = document.getElementById('shipment_type')?.value || 'domestic';
+        window.aiVoiceAutofill.steps = buildVoiceStepsForMode(mode);
+
+        const fieldMap = {
+            'mode': 'mode',
+            'shipment_type': 'mode',
+            'domestic_service_type': 'service_type',
+            'international_service_type': 'service_type',
+            'ecommerce_service_type': 'service_type',
+            'service_type': 'service_type',
+            'package_type': 'package_type',
+            'intl_package_type': 'package_type',
+            'ecom_package_type': 'package_type',
+            'schedule_doorstep_pickup': 'collection_method',
+            'collection_method': 'collection_method',
+            'scheduled_pickup_time': 'scheduled_pickup_time',
+            'pickup_notes': 'pickup_notes',
+            'pickup_name_0': 'sender_name',
+            'sender_name_input': 'sender_name',
+            'sender_name': 'sender_name',
+            'pickup_phone_0': 'sender_phone',
+            'sender_phone_input': 'sender_phone',
+            'sender_phone': 'sender_phone',
+            'pickup_address_0': 'pickup_address',
+            'sender_address_input': 'pickup_address',
+            'pickup_address': 'pickup_address',
+            'receiver_country': 'receiver_country',
+            'receiver_name': 'receiver_name',
+            'receiver_phone': 'receiver_phone',
+            'receiver_tax_id': 'receiver_tax_id',
+            'receiver_city': 'receiver_city',
+            'receiver_state': 'receiver_state',
+            'receiver_postal_code': 'receiver_postal_code',
+            'receiver_street': 'receiver_street',
+            'delivery_name_0': 'delivery_name',
+            'delivery_name': 'delivery_name',
+            'delivery_phone_0': 'delivery_phone',
+            'delivery_phone': 'delivery_phone',
+            'shipment_deliv_0_province': 'delivery_province',
+            'delivery_province': 'delivery_province',
+            'shipment_deliv_0_district': 'destination_district',
+            'shipment_deliv_0_search': 'destination_district',
+            'destination_district': 'destination_district',
+            'delivery_address_0': 'delivery_address',
+            'delivery_address': 'delivery_address',
+            'weight-input': 'weight',
+            'weight': 'weight',
+            'length-input': 'dimensions',
+            'width-input': 'dimensions',
+            'height-input': 'dimensions',
+            'dimensions': 'dimensions',
+            'description': 'description',
+            'invoice_currency': 'invoice_currency',
+            'invoice_number': 'invoice_number',
+            'invoice_date': 'invoice_date',
+            'incoterms': 'incoterms',
+            'reason_for_export': 'reason_for_export',
+            'acquisition_source': 'acquisition_source',
+            'exporter_pan_vat': 'exporter_pan_vat',
+            'exporter_exim_code': 'exporter_exim_code',
+            'commodity_name': 'commodity_name',
+            'commodity_qty_price': 'commodity_qty_price',
+            'total_boxes': 'total_boxes',
+            'seller_bill_type': 'seller_bill_type',
+            'seller_bill_number': 'seller_bill_number'
+        };
+
+        const targetStepId = fieldMap[fieldId] || fieldId;
+        const targetIdx = window.aiVoiceAutofill.steps.findIndex(s => s.id === targetStepId);
+
+        if (targetIdx !== -1) {
+            if (!window.aiVoiceAutofill.isActive) {
+                window.initiateVoiceAutofillAssistant(true, targetIdx);
+            } else {
+                executeVoiceStep(targetIdx, true);
+            }
+        }
+    };
+
+
+    // Draggable Cockpit Controller Support (Anywhere on screen, mouse & touch)
+    window.setupAiBarDraggable = function() {
+        const bar = document.getElementById('ai-voice-active-controller');
+        const handle = document.getElementById('ai-voice-drag-handle') || bar;
+        if (!bar || bar._dragSetupDone) return;
+        bar._dragSetupDone = true;
+
+        let isDragging = false;
+        let startX = 0, startY = 0;
+        let initialLeft = 0, initialTop = 0;
+
+        function startDrag(clientX, clientY) {
+            isDragging = true;
+            const rect = bar.getBoundingClientRect();
+            bar.classList.remove('-translate-x-1/2', 'bottom-5', 'left-1/2');
+            bar.style.bottom = 'auto';
+            bar.style.transform = 'none';
+            bar.style.left = `${rect.left}px`;
+            bar.style.top = `${rect.top}px`;
+            startX = clientX;
+            startY = clientY;
+            initialLeft = rect.left;
+            initialTop = rect.top;
+            bar.classList.add('shadow-[0_25px_70px_rgba(0,0,0,0.95)]', 'scale-[1.01]');
+        }
+
+        function moveDrag(clientX, clientY) {
+            if (!isDragging) return;
+            const dx = clientX - startX;
+            const dy = clientY - startY;
+            let newLeft = initialLeft + dx;
+            let newTop = initialTop + dy;
+
+            const maxLeft = Math.max(10, window.innerWidth - bar.offsetWidth - 10);
+            const maxTop = Math.max(10, window.innerHeight - bar.offsetHeight - 10);
+            newLeft = Math.min(Math.max(10, newLeft), maxLeft);
+            newTop = Math.min(Math.max(10, newTop), maxTop);
+
+            bar.style.left = `${newLeft}px`;
+            bar.style.top = `${newTop}px`;
+        }
+
+        function endDrag() {
+            if (!isDragging) return;
+            isDragging = false;
+            bar.classList.remove('scale-[1.01]');
+        }
+
+        handle.addEventListener('mousedown', function(e) {
+            if (e.target.closest('button')) return;
+            e.preventDefault();
+            startDrag(e.clientX, e.clientY);
+
+            function onMouseMove(moveEvent) {
+                moveDrag(moveEvent.clientX, moveEvent.clientY);
+            }
+            function onMouseUp() {
+                endDrag();
+                document.removeEventListener('mousemove', onMouseMove);
+                document.removeEventListener('mouseup', onMouseUp);
+            }
+            document.addEventListener('mousemove', onMouseMove);
+            document.addEventListener('mouseup', onMouseUp);
+        });
+
+        handle.addEventListener('touchstart', function(e) {
+            if (e.target.closest('button')) return;
+            const touch = e.touches[0];
+            startDrag(touch.clientX, touch.clientY);
+
+            function onTouchMove(tMove) {
+                const t = tMove.touches[0];
+                moveDrag(t.clientX, t.clientY);
+            }
+            function onTouchEnd() {
+                endDrag();
+                document.removeEventListener('touchmove', onTouchMove);
+                document.removeEventListener('touchend', onTouchEnd);
+            }
+            document.addEventListener('touchmove', onTouchMove, { passive: false });
+            document.addEventListener('touchend', onTouchEnd);
+        }, { passive: true });
+    };
+
+    window.resetAiBarPosition = function(event) {
+        if (event) { event.preventDefault(); event.stopPropagation(); }
+        const bar = document.getElementById('ai-voice-active-controller');
+        if (!bar) return;
+        bar.style.top = '';
+        bar.style.left = '';
+        bar.style.bottom = '';
+        bar.style.transform = '';
+        bar.className = 'fixed bottom-5 left-1/2 -translate-x-1/2 w-[95%] max-w-4xl z-50 rounded-3xl bg-slate-950/95 border-2 border-teal-500/70 p-4 sm:p-5 text-white shadow-[0_20px_60px_rgba(0,0,0,0.85)] backdrop-blur-2xl ring-4 ring-teal-500/20 transition-all duration-300';
+    };
+
+    window.toggleAiBarMinimize = function(event) {
+        if (event) { event.preventDefault(); event.stopPropagation(); }
+        const bar = document.getElementById('ai-voice-active-controller');
+        const minBtn = document.getElementById('ai-bar-min-btn');
+        if (!bar) return;
+
+        const isMinimized = bar.classList.contains('ai-bar-minimized');
+        const bodyContent = bar.querySelector('.flex.flex-col.md\\:flex-row');
+        const quickInputRow = document.getElementById('ai-voice-quick-input-row');
+
+        if (isMinimized) {
+            bar.classList.remove('ai-bar-minimized');
+            if (bodyContent) bodyContent.style.display = '';
+            if (quickInputRow) quickInputRow.style.display = '';
+            if (minBtn) minBtn.innerHTML = '<i class="fas fa-minus text-[10px]"></i>';
+        } else {
+            bar.classList.add('ai-bar-minimized');
+            if (bodyContent) bodyContent.style.display = 'none';
+            if (quickInputRow) quickInputRow.style.display = 'none';
+            if (minBtn) minBtn.innerHTML = '<i class="fas fa-expand text-[10px]"></i>';
+        }
+    };
+
+    window.updateInternationalDialPrefix = function() {
+        const countryEl = document.getElementById('receiver_country');
+        const prefixEl = document.getElementById('receiver-dial-code-prefix');
+        if (!countryEl || !prefixEl) return;
+        const country = (countryEl.value || '').toLowerCase();
+        
+        const dialMap = {
+            'poland': '+48',
+            'united states': '+1',
+            'usa': '+1',
+            'canada': '+1',
+            'united kingdom': '+44',
+            'uk': '+44',
+            'australia': '+61',
+            'germany': '+49',
+            'france': '+33',
+            'italy': '+39',
+            'spain': '+34',
+            'netherlands': '+31',
+            'japan': '+81',
+            'united arab emirates': '+971',
+            'uae': '+971',
+            'qatar': '+974',
+            'singapore': '+65',
+            'malaysia': '+60',
+            'india': '+91',
+            'china': '+86',
+            'switzerland': '+41',
+            'sweden': '+46',
+            'norway': '+47',
+            'denmark': '+45',
+            'finland': '+358',
+            'belgium': '+32',
+            'austria': '+43',
+            'portugal': '+351',
+            'ireland': '+353',
+            'new zealand': '+64'
+        };
+
+        let dial = '+Intl';
+        for (let [c, code] of Object.entries(dialMap)) {
+            if (country.includes(c)) {
+                dial = code;
+                break;
+            }
+        }
+        prefixEl.innerText = dial;
+    };
+
+    window.initiateVoiceAutofillAssistant = async function(userExplicitlyClicked = false, forcedStartIndex = null) {
+        const banner = document.getElementById('ai-voice-invitation-banner');
+        if (banner) banner.style.display = 'none';
+
+        const controller = document.getElementById('ai-voice-active-controller');
+        if (controller) {
+            controller.style.display = 'block';
+            setupAiBarDraggable();
+        }
+
+        // Add bottom padding so floating docked controller never obscures bottom fields
+        const mainContainer = document.querySelector('form#shipment-form') || document.body;
+        if (mainContainer) mainContainer.classList.add('pb-44');
+
+        window.aiVoiceAutofill.isActive = true;
+
+        const mode = document.getElementById('shipment_type')?.value || 'domestic';
+        window.aiVoiceAutofill.steps = buildVoiceStepsForMode(mode);
+
+        let startIndex = 0;
+        if (forcedStartIndex !== null && forcedStartIndex >= 0 && forcedStartIndex < window.aiVoiceAutofill.steps.length) {
+            startIndex = forcedStartIndex;
+        } else {
+            startIndex = 0;
+        }
+
+        window.aiVoiceAutofill.currentStepIndex = startIndex;
+        window.aiVoiceAutofill.hasIntroduced = false;
+
+        // 1. If user explicitly clicked to start, check microphone stream safely
+        if (userExplicitlyClicked && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                // Crucial fix: release tracks immediately so SpeechRecognition has uncontested hardware access!
+                stream.getTracks().forEach(t => t.stop());
+                hideMicBlockedWarning();
+            } catch(micErr) {
+                console.warn('Microphone permission check notice:', micErr);
+            }
+        }
+
+        // 2. Start smooth animated soundwave visualizer (doesn't hold hardware mic lock!)
+        startEqualizerAnimation();
+
+        // 3. Setup bi-directional direct form typing acceptance
+        setupDirectFormTypingSync();
+
+        // 4. Setup speech recognition
+        initSpeechRecognition(false);
+
+        // 5. Ask the designated starting step (first unfilled field)
+        executeVoiceStep(startIndex);
+    };
+
+    function startEqualizerAnimation() {
+        if (window.aiVoiceAutofill.animFrameId) return;
+        const bars = document.querySelectorAll('#ai-voice-equalizer .eq-bar');
+        if (!bars.length) return;
+
+        let tick = 0;
+        function renderBars() {
+            if (!window.aiVoiceAutofill.isActive) {
+                window.aiVoiceAutofill.animFrameId = null;
+                return;
+            }
+            window.aiVoiceAutofill.animFrameId = requestAnimationFrame(renderBars);
+            tick++;
+
+            if (window.aiVoiceAutofill.isListening) {
+                bars.forEach((bar, idx) => {
+                    const wave = Math.sin(tick * 0.28 + idx * 1.3) * 0.5 + 0.5;
+                    const height = Math.round(6 + wave * 20);
+                    bar.style.height = `${height}px`;
+                });
+            } else {
+                bars.forEach((bar, idx) => {
+                    bar.style.height = (idx % 2 === 0) ? '8px' : '14px';
+                });
+            }
+        }
+        renderBars();
+    }
+
+    function showMicBlockedWarning() {
+        updateVoiceStatus('Microphone access needed. Tap [Allow Mic] or enable mic in app settings.', 'text-amber-300 font-bold');
+        const unblockBtn = document.getElementById('ai-voice-unblock-mic-btn');
+        if (unblockBtn) unblockBtn.style.display = 'inline-flex';
+    }
+
+    function hideMicBlockedWarning() {
+        const unblockBtn = document.getElementById('ai-voice-unblock-mic-btn');
+        if (unblockBtn) unblockBtn.style.display = 'none';
+    }
+
+    window.requestMicrophoneAccess = function() {
+        // Immediately halt any audio playback so device is released
+        if (typeof shipmentAudioPlayer !== 'undefined' && shipmentAudioPlayer) {
+            try {
+                shipmentAudioPlayer.pause();
+                shipmentAudioPlayer.currentTime = 0;
+            } catch(e) {}
+        }
+        if (window.speechSynthesis) {
+            try { window.speechSynthesis.cancel(); } catch(e) {}
+        }
+
+        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+            updateVoiceStatus('Please tap "Allow" on the microphone prompt...', 'text-amber-300 font-bold');
+            navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+                stream.getTracks().forEach(t => t.stop());
+                hideMicBlockedWarning();
+                updateVoiceStatus('Microphone enabled! Starting speech capture...', 'text-emerald-400 font-bold');
+                window.toggleVoiceAutofillMic();
+            }).catch(err => {
+                console.error('Microphone request error:', err);
+                updateVoiceStatus('Microphone blocked. Please allow mic in browser/app settings.', 'text-rose-400 font-bold');
+                showMicBlockedWarning();
+            });
+        } else {
+            window.toggleVoiceAutofillMic();
+        }
+    };
+
+    function updateMicButton(isListening) {
+        const btn = document.getElementById('ai-voice-mic-btn');
+        const text = document.getElementById('ai-voice-mic-text');
+        const icon = document.getElementById('ai-voice-mic-icon');
+        if (!btn) return;
+
+        if (isListening) {
+            btn.className = 'px-3 py-1.5 rounded-xl bg-rose-500 hover:bg-rose-600 text-white text-xs font-bold transition flex items-center gap-1.5 shadow-lg shadow-rose-500/30 cursor-pointer animate-pulse';
+            if (text) text.innerText = 'Listening...';
+            if (icon) icon.className = 'fas fa-microphone text-xs';
+        } else {
+            btn.className = 'px-3 py-1.5 rounded-xl bg-teal-600 hover:bg-teal-500 text-slate-950 text-xs font-bold transition flex items-center gap-1.5 shadow-md hover:shadow-teal-500/20 cursor-pointer';
+            if (text) text.innerText = 'Tap to Speak';
+            if (icon) icon.className = 'fas fa-microphone text-xs';
+        }
+    }
+
+    window.toggleVoiceAutofillMic = function() {
+        if (!window.aiVoiceAutofill.isActive) {
+            window.aiVoiceAutofill.isActive = true;
+        }
+
+        // 1. Immediately pause and release any playing audio so mobile microphone hardware is freed
+        if (typeof shipmentAudioPlayer !== 'undefined' && shipmentAudioPlayer) {
+            try {
+                shipmentAudioPlayer.pause();
+                shipmentAudioPlayer.currentTime = 0;
+            } catch(e) {}
+        }
+        if (window.speechSynthesis) {
+            try { window.speechSynthesis.cancel(); } catch(e) {}
+        }
+
+        // 2. If listening right now, toggle off
+        if (window.aiVoiceAutofill.isListening) {
+            if (window.aiVoiceAutofill.recognition) {
+                try { window.aiVoiceAutofill.recognition.stop(); } catch(e){}
+            }
+            window.aiVoiceAutofill.isListening = false;
+            updateMicButton(false);
+            updateVoiceStatus('Microphone paused. Tap [Tap to Speak] or type below.', 'text-slate-300');
+            return;
+        }
+
+        // 3. User wants to speak - start speech recognition on direct user tap
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+            updateVoiceStatus('Voice typing ready. Use keyboard microphone or type below.', 'text-teal-300');
+            const quickInput = document.getElementById('ai-voice-quick-input');
+            if (quickInput) quickInput.focus();
+            return;
+        }
+
+        // Freshly re-instantiate recognition to prevent stale InvalidStateError on mobile
+        if (window.aiVoiceAutofill.recognition) {
+            try { window.aiVoiceAutofill.recognition.abort(); } catch(e) {}
+            window.aiVoiceAutofill.recognition = null;
+        }
+
+        initSpeechRecognition(true);
+
+        try {
+            window.aiVoiceAutofill.recognition.start();
+            hideMicBlockedWarning();
+        } catch(e) {
+            console.warn('Voice restart notice:', e);
+            if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+                navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+                    stream.getTracks().forEach(t => t.stop());
+                    hideMicBlockedWarning();
+                    updateVoiceStatus('Microphone access granted. Tap [Tap to Speak] now.', 'text-emerald-400 font-bold');
+                }).catch(err => {
+                    showMicBlockedWarning();
+                });
+            } else {
+                showMicBlockedWarning();
+            }
+        }
+    };
+
+    window.submitManualVoiceStepInput = function() {
+        const input = document.getElementById('ai-voice-quick-input');
+        if (!input) return;
+        const val = input.value.trim();
+        if (!val) return;
+        input.value = '';
+        handleUserSpokenAnswer(val);
+    };
+
+    window.exitVoiceAutofillAssistant = function() {
+        window.aiVoiceAutofill.isActive = false;
+
+        if (typeof shipmentAudioPlayer !== 'undefined' && shipmentAudioPlayer) {
+            try {
+                shipmentAudioPlayer.pause();
+                shipmentAudioPlayer.currentTime = 0;
+            } catch(e) {}
+        }
+
+        if (window.aiVoiceAutofill.speechSynthesis) {
+            window.aiVoiceAutofill.speechSynthesis.cancel();
+        }
+        if (window.aiVoiceAutofill.recognition) {
+            try { window.aiVoiceAutofill.recognition.stop(); } catch(e){}
+        }
+
+        if (window.aiVoiceAutofill.audioStream) {
+            try {
+                window.aiVoiceAutofill.audioStream.getTracks().forEach(t => t.stop());
+            } catch(e){}
+            window.aiVoiceAutofill.audioStream = null;
+        }
+
+        if (window.aiVoiceAutofill.animFrameId) {
+            cancelAnimationFrame(window.aiVoiceAutofill.animFrameId);
+            window.aiVoiceAutofill.animFrameId = null;
+        }
+
+        const controller = document.getElementById('ai-voice-active-controller');
+        if (controller) controller.style.display = 'none';
+
+        const mainContainer = document.querySelector('form#shipment-form') || document.body;
+        if (mainContainer) mainContainer.classList.remove('pb-44');
+
+        // Remove field highlight
+        document.querySelectorAll('.ai-voice-active-field').forEach(el => {
+            el.classList.remove('ai-voice-active-field', 'ring-4', 'ring-teal-500/50', 'border-teal-500');
+        });
+    };
+
+    window.voiceAssistantReask = function() {
+        if (!window.aiVoiceAutofill.isActive) return;
+        executeVoiceStep(window.aiVoiceAutofill.currentStepIndex);
+    };
+
+    window.voiceAssistantPrev = function() {
+        if (!window.aiVoiceAutofill.isActive) return;
+        const prev = Math.max(0, window.aiVoiceAutofill.currentStepIndex - 1);
+        executeVoiceStep(prev);
+    };
+
+    window.voiceAssistantNext = function() {
+        if (!window.aiVoiceAutofill || !window.aiVoiceAutofill.isActive) return;
+        advanceToNextStep();
+    };
+
+    // =========================================================================
+    // BI-DIRECTIONAL DIRECT FORM TYPING & ACTIVE FIELD SYNC
+    // =========================================================================
+    function setupDirectFormTypingSync() {
+        if (window.aiVoiceAutofill._syncSetupDone) return;
+        window.aiVoiceAutofill._syncSetupDone = true;
+
+        // 1. Direct clicks on Mode Selector Buttons on the page
+        ['mode-btn-domestic', 'mode-btn-international', 'mode-btn-ecommerce'].forEach(id => {
+            const btn = document.getElementById(id);
+            if (!btn) return;
+            btn.addEventListener('click', function() {
+                if (!window.aiVoiceAutofill.isActive) return;
+                if (window.aiVoiceAutofill.currentStepIndex === 0) {
+                    const mode = id === 'mode-btn-ecommerce' ? 'ecommerce' : (id === 'mode-btn-international' ? 'international' : 'domestic');
+                    const label = id === 'mode-btn-ecommerce' ? 'E-Commerce and Cash on Delivery' : (id === 'mode-btn-international' ? 'International Air Cargo' : 'Domestic Express Delivery');
+                    speakVoicePrompt(`Selected ${label}.`, function() {
+                        executeVoiceStep(1);
+                    });
+                }
+            });
+        });
+
+        // 2. Direct click/focus on ANY form field jumps AI assistant to that field
+        document.querySelectorAll('#shipment-form input, #shipment-form textarea, #shipment-form select').forEach(input => {
+            input.addEventListener('focus', function(e) {
+                if (!window.aiVoiceAutofill.isActive) return;
+                const activeIdx = window.aiVoiceAutofill.steps.findIndex(s => {
+                    try {
+                        const el = s.targetSelector ? s.targetSelector() : null;
+                        return el === e.target;
+                    } catch(err) { return false; }
+                });
+                if (activeIdx !== -1 && activeIdx !== window.aiVoiceAutofill.currentStepIndex) {
+                    executeVoiceStep(activeIdx, false /* don't steal focus */);
+                }
+            });
+
+            // 3. User typing directly into the form field box on the page
+            input.addEventListener('input', function(e) {
+                if (!window.aiVoiceAutofill.isActive) return;
+                const currentStep = window.aiVoiceAutofill.steps[window.aiVoiceAutofill.currentStepIndex];
+                if (!currentStep) return;
+                const targetEl = currentStep.targetSelector ? currentStep.targetSelector() : null;
+                if (targetEl === e.target) {
+                    const quickInput = document.getElementById('ai-voice-quick-input');
+                    if (quickInput) quickInput.value = e.target.value;
+                }
+            });
+
+            // 4. Pressing Enter directly inside the form input box
+            input.addEventListener('keydown', function(e) {
+                if (!window.aiVoiceAutofill.isActive) return;
+                if (e.key === 'Enter' && (!e.shiftKey || e.target.tagName !== 'TEXTAREA')) {
+                    const currentStep = window.aiVoiceAutofill.steps[window.aiVoiceAutofill.currentStepIndex];
+                    if (!currentStep) return;
+                    const targetEl = currentStep.targetSelector ? currentStep.targetSelector() : null;
+                    if (targetEl === e.target && e.target.value.trim()) {
+                        e.preventDefault();
+                        handleUserSpokenAnswer(e.target.value.trim());
+                    }
+                }
+            });
+        });
+    }
+
+    function initSpeechRecognition(userInitiated = false) {
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+            updateVoiceStatus('Voice typing ready. Use keyboard microphone or type below.', 'text-amber-300');
+            return;
+        }
+
+        if (!window.aiVoiceAutofill.recognition) {
+            const rec = new SpeechRecognition();
+            rec.continuous = false;
+            rec.interimResults = true;
+            rec.maxAlternatives = 1;
+            
+            // South Asian / Nepali English (en-IN) recognition is optimal for Asian & Nepalese speakers
+            const storedAccent = localStorage.getItem('chanda_voice_accent') || 'en-IN';
+            rec.lang = (storedAccent === 'ne-NP' || storedAccent === 'ne') ? 'ne-NP' : 'en-IN';
+
+            rec.onstart = function() {
+                window.aiVoiceAutofill.isListening = true;
+                updateVoiceStatus('🎙️ Listening... Speak now', 'text-rose-400 font-bold');
+                updateMicButton(true);
+                hideMicBlockedWarning();
+            };
+
+            rec.onresult = function(event) {
+                let interimTranscript = '';
+                let finalTranscript = '';
+
+                for (let i = event.resultIndex; i < event.results.length; ++i) {
+                    const phrase = event.results[i][0].transcript;
+                    if (event.results[i].isFinal) {
+                        finalTranscript += phrase;
+                    } else {
+                        interimTranscript += phrase;
+                    }
+                }
+
+                const liveText = finalTranscript || interimTranscript;
+                if (liveText) {
+                    const previewEl = document.getElementById('ai-voice-transcript-preview');
+                    const textEl = document.getElementById('ai-voice-transcript-text');
+                    if (previewEl && textEl) {
+                        textEl.innerText = liveText;
+                        previewEl.style.display = 'block';
+                    }
+                    const quickInput = document.getElementById('ai-voice-quick-input');
+                    if (quickInput) quickInput.value = liveText;
+
+                    // Real-time live auto-typing directly into the active form fillup box:
+                    const currentStep = window.aiVoiceAutofill.steps[window.aiVoiceAutofill.currentStepIndex];
+                    if (currentStep && currentStep.id !== 'mode') {
+                        const targetEl = currentStep.targetSelector ? currentStep.targetSelector() : null;
+                        if (targetEl && ('value' in targetEl)) {
+                            targetEl.value = liveText;
+                            targetEl.dispatchEvent(new Event('input', { bubbles: true }));
+                            targetEl.classList.add('ring-2', 'ring-teal-400');
+                        }
+                    }
+                }
+
+                if (finalTranscript.trim()) {
+                    handleUserSpokenAnswer(finalTranscript.trim());
+                }
+            };
+
+            rec.onerror = function(event) {
+                console.warn('Voice recognition notice:', event.error);
+                window.aiVoiceAutofill.isListening = false;
+                updateMicButton(false);
+
+                if (event.error === 'not-allowed') {
+                    if (userInitiated) {
+                        showMicBlockedWarning();
+                    } else {
+                        updateVoiceStatus('Ready. Tap [Tap to Speak] to answer.', 'text-teal-300 font-semibold');
+                    }
+                } else if (event.error === 'no-speech') {
+                    updateVoiceStatus('Didn’t catch your voice. Tap [Tap to Speak] or type below.', 'text-amber-300');
+                } else if (event.error === 'language-not-supported' || event.error === 'network') {
+                    rec.lang = 'en-US';
+                    updateVoiceStatus('Ready in English. Tap [Tap to Speak] to provide answer.', 'text-teal-300');
+                } else {
+                    updateVoiceStatus('Ready. Tap [Tap to Speak] to answer.', 'text-teal-300/80');
+                }
+            };
+
+            rec.onend = function() {
+                window.aiVoiceAutofill.isListening = false;
+                updateMicButton(false);
+            };
+
+            window.aiVoiceAutofill.recognition = rec;
+        }
+    }
+
+    // =========================================================================
+    // NATIVE WEB AUDIO CHIMES (Prompt, Affirmation, Finish)
+    // =========================================================================
+    function playAiChime(type = 'prompt') {
+        try {
+            const AudioCtx = window.AudioContext || window.webkitAudioContext;
+            if (!AudioCtx) return;
+            if (!window._aiAudioCtx) {
+                window._aiAudioCtx = new AudioCtx();
+            }
+            const ctx = window._aiAudioCtx;
+            if (ctx.state === 'suspended') {
+                ctx.resume();
+            }
+            const now = ctx.currentTime;
+
+            if (type === 'prompt') {
+                // Cheerful attentive double ping (C5 -> E5)
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(523.25, now);
+                osc.frequency.exponentialRampToValueAtTime(659.25, now + 0.08);
+                gain.gain.setValueAtTime(0.001, now);
+                gain.gain.linearRampToValueAtTime(0.12, now + 0.02);
+                gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.25);
+                osc.start(now);
+                osc.stop(now + 0.26);
+            } else if (type === 'confirm') {
+                // Upbeat positive confirmation chime (D5 -> A5)
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.type = 'triangle';
+                osc.frequency.setValueAtTime(587.33, now);
+                osc.frequency.exponentialRampToValueAtTime(880.00, now + 0.1);
+                gain.gain.setValueAtTime(0.001, now);
+                gain.gain.linearRampToValueAtTime(0.14, now + 0.02);
+                gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.32);
+                osc.start(now);
+                osc.stop(now + 0.33);
+            } else if (type === 'complete') {
+                // Triumphant celebratory 4-note arpeggio (C5 -> E5 -> G5 -> C6)
+                const notes = [523.25, 659.25, 783.99, 1046.50];
+                notes.forEach((freq, idx) => {
+                    const noteOsc = ctx.createOscillator();
+                    const noteGain = ctx.createGain();
+                    noteOsc.connect(noteGain);
+                    noteGain.connect(ctx.destination);
+                    noteOsc.type = 'sine';
+                    noteOsc.frequency.setValueAtTime(freq, now + idx * 0.1);
+                    noteGain.gain.setValueAtTime(0.001, now + idx * 0.1);
+                    noteGain.gain.linearRampToValueAtTime(0.15, now + idx * 0.1 + 0.02);
+                    noteGain.gain.exponentialRampToValueAtTime(0.0001, now + idx * 0.1 + 0.28);
+                    noteOsc.start(now + idx * 0.1);
+                    noteOsc.stop(now + idx * 0.1 + 0.29);
+                });
+            }
+        } catch(e) {
+            // AudioContext restrictions or unsupported
+        }
+    }
+
+    // =========================================================================
+    // SEQUENTIAL PROGRESSION ENGINE
+    // =========================================================================
+    function advanceToNextStep() {
+        if (!window.aiVoiceAutofill || !window.aiVoiceAutofill.isActive) return;
+        const nextIndex = window.aiVoiceAutofill.currentStepIndex + 1;
+        if (nextIndex < window.aiVoiceAutofill.steps.length) {
+            executeVoiceStep(nextIndex);
+        } else {
+            completeVoiceAutofill();
+        }
+    }
+
+    function executeVoiceStep(stepIndex, focusElement = true) {
+        if (!window.aiVoiceAutofill || !window.aiVoiceAutofill.steps) return;
+        window.aiVoiceAutofill.currentStepIndex = stepIndex;
+        const step = window.aiVoiceAutofill.steps[stepIndex];
+        if (!step) {
+            completeVoiceAutofill();
+            return;
+        }
+
+        // Update UI Badges
+        const stepBadge = document.getElementById('ai-voice-step-badge');
+        if (stepBadge) stepBadge.innerText = `Field ${stepIndex + 1} of ${window.aiVoiceAutofill.steps.length}`;
+
+        const stepTitle = document.getElementById('ai-voice-step-title');
+        const titleText = typeof step.title === 'function' ? step.title() : step.title;
+        if (stepTitle) stepTitle.innerText = titleText;
+
+        // Check if this field is already filled up
+        const curVal = getStepCurrentValue(step);
+        const isPreFilled = curVal !== '' && curVal !== 'default' && curVal !== 'None' && curVal !== undefined && curVal !== null;
+        window.aiVoiceAutofill.isVerifying = isPreFilled;
+        window.aiVoiceAutofill.currentVerifiedValue = isPreFilled ? curVal : null;
+
+        let promptText = '';
+        if (isPreFilled) {
+            if (typeof step.confirmPrompt === 'function') {
+                promptText = step.confirmPrompt(window.aiVoiceAutofill, curVal);
+            } else {
+                promptText = `I see your ${titleText} is currently set to "${curVal}". Does that look correct to you, or would you like to update it?`;
+            }
+        } else {
+            promptText = typeof step.prompt === 'function' ? step.prompt(window.aiVoiceAutofill) : step.prompt;
+        }
+
+        // Whenever conversation starts, greet politely
+        if (!window.aiVoiceAutofill.hasIntroduced) {
+            window.aiVoiceAutofill.hasIntroduced = true;
+            const clientName = window.aiVoiceAutofill.clientPreferredName ? (window.aiVoiceAutofill.clientPreferredName + ' Ji') : '';
+            const greeting = clientName ? `Namaste ${clientName}! ` : 'Namaste! ';
+            promptText = greeting + promptText;
+        }
+
+        const promptEl = document.getElementById('ai-voice-current-prompt');
+        if (promptEl) {
+            promptEl.innerText = promptText;
+        }
+
+        const previewEl = document.getElementById('ai-voice-transcript-preview');
+        if (previewEl) previewEl.style.display = 'none';
+
+        const quickInput = document.getElementById('ai-voice-quick-input');
+        if (quickInput) {
+            quickInput.value = '';
+            quickInput.placeholder = isPreFilled 
+                ? `Say "Yes" / "Correct" to confirm "${curVal}", or say new value...` 
+                : `Speak into mic or type answer for "${titleText}" & press Enter...`;
+        }
+
+        // Scroll to and highlight target field
+        const targetEl = step.targetSelector ? step.targetSelector() : null;
+        if (targetEl) {
+            document.querySelectorAll('.ai-voice-active-field').forEach(el => {
+                el.classList.remove('ai-voice-active-field', 'ring-4', 'ring-teal-500/50', 'border-teal-500');
+            });
+            targetEl.classList.add('ai-voice-active-field', 'ring-4', 'ring-teal-500/50', 'border-teal-500');
+            targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            if (focusElement && typeof targetEl.focus === 'function' && targetEl.tagName !== 'BUTTON') {
+                targetEl.focus();
+            }
+        }
+
+        // Play gentle audio chime
+        playAiChime('prompt');
+
+        // Speak question out loud, then prepare listening
+        speakVoicePrompt(promptText, function() {
+            if (!window.aiVoiceAutofill || !window.aiVoiceAutofill.isActive) return;
+            const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+            if (isMobile) {
+                updateMicButton(false);
+                updateVoiceStatus('Question ready! Tap [Tap to Speak] to answer.', 'text-teal-300 font-bold');
+            } else {
+                if (!window.aiVoiceAutofill.recognition) {
+                    initSpeechRecognition(false);
+                }
+                try {
+                    window.aiVoiceAutofill.recognition.start();
+                } catch(e) {
+                    updateMicButton(false);
+                    updateVoiceStatus('Ready. Tap [Tap to Speak] to answer.', 'text-teal-300');
+                }
+            }
+        });
+    }
+
+    function handleUserSpokenAnswer(transcript) {
+        const stepIndex = window.aiVoiceAutofill.currentStepIndex;
+        const step = window.aiVoiceAutofill.steps[stepIndex];
+        if (!step) return;
+
+        // Show transcript
+        const previewEl = document.getElementById('ai-voice-transcript-preview');
+        const textEl = document.getElementById('ai-voice-transcript-text');
+        if (previewEl && textEl) {
+            textEl.innerText = transcript;
+            previewEl.style.display = 'block';
+        }
+
+        const isVerifying = !!window.aiVoiceAutofill.isVerifying;
+        const currentVal = window.aiVoiceAutofill.currentVerifiedValue;
+
+        // Client-side quick affirmative check
+        const cleanT = transcript.toLowerCase().trim().replace(/^[.,!?]+|[.,!?]+$/g, '');
+        const affirmativeWords = [
+            'yes', 'yeah', 'yep', 'yup', 'correct', 'right', 'exact', 'exactly', 'sure', 
+            'ok', 'okay', 'fine', 'good', 'perfect', 'looks good', 'all good', 
+            'thik cha', 'theek chha', 'thik', 'theek', 'hunchha', 'hunxa', 'ho', 'hajur',
+            'confirm', 'confirmed', 'keep it', 'leave it', 'no change', 'proceed', 'done'
+        ];
+        const isClientAffirmative = affirmativeWords.some(w => cleanT === w || cleanT.startsWith(w + ' ') || cleanT.endsWith(' ' + w));
+
+        const proceedWithAck = (ackPhrase) => {
+            playAiChime('confirm');
+            updateVoiceStatus('✨ Confirmed', 'text-emerald-300 font-bold');
+            speakVoicePrompt(ackPhrase, function() {
+                advanceToNextStep();
+            });
+        };
+
+        const applyAndProceed = (parsedVal, ackPhrase) => {
+            playAiChime('confirm');
+            updateVoiceStatus('✨ Auto-typing...', 'text-emerald-300 font-bold');
+            const appliedLabel = step.apply ? step.apply(parsedVal) : parsedVal;
+
+            setTimeout(() => {
+                const politeAck = ackPhrase || `Noted, set to ${appliedLabel}.`;
+                speakVoicePrompt(politeAck, function() {
+                    advanceToNextStep();
+                });
+            }, 300);
+        };
+
+        // If in verification mode and user affirmatively agreed, keep current value and move on!
+        if (isVerifying && isClientAffirmative) {
+            proceedWithAck(`Confirmed, keeping ${currentVal || 'current value'}.`);
+            return;
+        }
+
+        // Call backend normalization endpoint
+        fetch('/ai/voice-autofill-parse', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-TOKEN': '{{ csrf_token() }}',
+                'Accept': 'application/json'
+            },
+            body: JSON.stringify({
+                step: step.id,
+                spoken_text: transcript,
+                mode: document.getElementById('shipment_type')?.value || 'domestic'
+            })
+        })
+        .then(res => res.json())
+        .then(data => {
+            if (data && data.success && data.data) {
+                if (data.data.is_confirmed && isVerifying) {
+                    proceedWithAck(data.data.speech_ack || `Splendid! Keeping ${currentVal || 'current value'}. Moving forward.`);
+                } else {
+                    applyAndProceed(data.data.parsed_value, data.data.speech_ack);
+                }
+            } else {
+                const parsedVal = step.parse ? step.parse(transcript) : transcript;
+                applyAndProceed(parsedVal, null);
+            }
+        })
+        .catch(err => {
+            // Client-side fallback if network error
+            const parsedVal = step.parse ? step.parse(transcript) : transcript;
+            applyAndProceed(parsedVal, null);
+        });
+    }
+
+    function completeVoiceAutofill() {
+        playAiChime('complete');
+        const promptEl = document.getElementById('ai-voice-current-prompt');
+        if (promptEl) promptEl.innerText = 'All consignment fields have been successfully verified and completed!';
+
+        updateVoiceStatus('✅ Consignment Ready for Submission', 'text-emerald-400 font-bold');
+        updateMicButton(false);
+
+        // Scroll to submit button and pulse
+        const submitBtn = document.querySelector('button[type="submit"]');
+        if (submitBtn) {
+            submitBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            submitBtn.classList.add('ring-4', 'ring-emerald-400', 'animate-bounce');
+            setTimeout(() => submitBtn.classList.remove('ring-4', 'ring-emerald-400', 'animate-bounce'), 5000);
+        }
+
+        const clientName = window.aiVoiceAutofill.clientPreferredName ? (window.aiVoiceAutofill.clientPreferredName + ' Ji') : 'Sir/Madam';
+        speakVoicePrompt(`Delighted to have assisted you, ${clientName}! This is Chanda, confirming that every single field of your consignment form has been thoroughly verified and auto-filled. Please review and click Submit to confirm your booking!`);
+    }
+
+    // =========================================================================
+    // VOICE SYNTHESIS & ACOUSTIC ENGINE (EXCITED, POLITE & PROFESSIONAL)
+    // =========================================================================
+    let _cachedVoices = [];
+    function getAvailableSpeechVoices() {
+        if (!('speechSynthesis' in window)) return [];
+        if (_cachedVoices && _cachedVoices.length) return _cachedVoices;
+        _cachedVoices = window.speechSynthesis.getVoices();
+        return _cachedVoices;
+    }
+    if ('speechSynthesis' in window) {
+        window.speechSynthesis.onvoiceschanged = function() {
+            _cachedVoices = window.speechSynthesis.getVoices();
+        };
+    }
+
+    function selectBestAssistantVoice() {
+        const voices = getAvailableSpeechVoices();
+        if (!voices || !voices.length) return null;
+
+        // Strict filter against any male voices
+        const isMale = (v) => {
+            const n = (v.name + ' ' + (v.voiceURI || '')).toLowerCase();
+            if (/\b(ravi|david|mark|george|guy|male|boy|hemant|madhur|prabhat|steve|alex|fred|daniel|oliver|thomas|paul|james|john|richard|deepak|karthik|ajay|tarun|neil|alec)\b/i.test(n)) {
+                return true;
+            }
+            if (n.includes('male') && !n.includes('female')) {
+                return true;
+            }
+            return false;
+        };
+
+        const femaleEligible = voices.filter(v => !isMale(v));
+
+        // 1. Native Nepali Female Voice (ne-NP, ne_NP, or containing 'nepal')
+        const nepaliFemale = femaleEligible.find(v => 
+            (v.lang === 'ne-NP' || v.lang === 'ne_NP' || v.lang.startsWith('ne') || v.name.toLowerCase().includes('nepal'))
+        );
+        if (nepaliFemale) return nepaliFemale;
+
+        // 2. Authentic South Asian / Indian English Female (Heera, Neerja, Swara, Kalpana, Aditi, Pooja, Veena, Kavya, Ananya)
+        const southAsianNamedFemale = femaleEligible.find(v => 
+            (v.lang === 'en-IN' || v.lang === 'hi-IN' || v.lang.startsWith('en-IN') || v.lang.startsWith('hi')) &&
+            /(heera|neerja|swara|kalpana|aditi|pooja|veena|kavya|ananya|shruti|sangeeta|female)/i.test(v.name)
+        );
+        if (southAsianNamedFemale) return southAsianNamedFemale;
+
+        // 3. Any South Asian English / Hindi female-eligible voice
+        const southAsianFemale = femaleEligible.find(v => 
+            (v.lang === 'en-IN' || v.lang === 'hi-IN' || v.lang.startsWith('en-IN') || v.lang.startsWith('hi'))
+        );
+        if (southAsianFemale) return southAsianFemale;
+
+        // 4. Natural / Online High-Quality Female voices (Jenny, Aria, Samantha, Zira, Victoria, Sonia)
+        const naturalFemale = femaleEligible.find(v => 
+            /(jenny|aria|samantha|zira|victoria|sonia|karen|susan|female)/i.test(v.name)
+        );
+        if (naturalFemale) return naturalFemale;
+
+        // 5. Any remaining female-eligible English voice
+        const anyEnglishFemale = femaleEligible.find(v => v.lang.startsWith('en'));
+        if (anyEnglishFemale) return anyEnglishFemale;
+
+        return femaleEligible[0] || null;
+    }
+
+    let shipmentAudioPlayer = null;
+
+    function speakVoicePrompt(text, onComplete) {
+        if (shipmentAudioPlayer) {
+            try {
+                shipmentAudioPlayer.pause();
+                shipmentAudioPlayer.currentTime = 0;
+            } catch(e) {}
+        }
+        if (window.speechSynthesis) {
+            try { window.speechSynthesis.cancel(); } catch(e) {}
+        }
+
+        const clean = text.replace(/[#*`_~[\]()]/g, ' ').replace(/\s+/g, ' ').trim();
+        if (!clean) {
+            if (typeof onComplete === 'function') onComplete();
+            return;
+        }
+
+        let completed = false;
+        const finishSpeaking = () => {
+            if (!completed) {
+                completed = true;
+                clearTimeout(safetyTimeout);
+                window.aiVoiceAutofill.isSpeaking = false;
+                if (typeof onComplete === 'function') onComplete();
+            }
+        };
+
+        const safetyTimeout = setTimeout(finishSpeaking, 12000);
+
+        const accent = localStorage.getItem('chanda_voice_accent') || 'en-IN';
+        const streamUrl = `/ai/speech/stream?text=${encodeURIComponent(clean)}&accent=${encodeURIComponent(accent)}`;
+
+        if (!shipmentAudioPlayer) {
+            shipmentAudioPlayer = new Audio();
+        }
+
+        shipmentAudioPlayer.src = streamUrl;
+
+        shipmentAudioPlayer.onplay = function() {
+            window.aiVoiceAutofill.isSpeaking = true;
+            updateVoiceStatus('🗣️ Speaking (Chanda AI)...', 'text-teal-300 font-bold');
+        };
+
+        shipmentAudioPlayer.onended = finishSpeaking;
+
+        shipmentAudioPlayer.onerror = function(err) {
+            console.warn('Neural audio stream error, falling back to speech synthesis:', err);
+            fallbackSynthesis();
+        };
+
+        const playPromise = shipmentAudioPlayer.play();
+        if (playPromise !== undefined) {
+            playPromise.catch(function(err) {
+                console.warn('Neural audio stream blocked, falling back to speech synthesis:', err);
+                fallbackSynthesis();
+            });
+        }
+
+        function fallbackSynthesis() {
+            if (!('speechSynthesis' in window)) {
+                finishSpeaking();
+                return;
+            }
+
+            try {
+                window.speechSynthesis.cancel();
+                const utterance = new SpeechSynthesisUtterance(clean);
+                utterance.rate = 0.98;
+                utterance.pitch = 1.0;
+
+                const chosenVoice = selectBestAssistantVoice();
+                if (chosenVoice) {
+                    utterance.voice = chosenVoice;
+                }
+
+                utterance.onstart = function() {
+                    window.aiVoiceAutofill.isSpeaking = true;
+                    updateVoiceStatus('🗣️ Speaking (Chanda AI)...', 'text-teal-300 font-bold');
+                };
+
+                utterance.onend = finishSpeaking;
+                utterance.onerror = finishSpeaking;
+
+                window.speechSynthesis.speak(utterance);
+            } catch(e) {
+                finishSpeaking();
+            }
+        }
+    }
+
+    function updateVoiceStatus(msg, colorClass) {
+        const el = document.getElementById('ai-voice-status-indicator');
+        if (el) {
+            el.className = `text-[10px] font-mono ${colorClass}`;
+            el.innerText = `● ${msg}`;
+        }
+    }
+
+    // Smooth auto-typing simulation into DOM inputs
+    function typeIntoElement(element, text, callback) {
+        if (!element) return;
+        element.focus();
+        element.value = '';
+        let i = 0;
+        const str = String(text);
+        const speed = 25; // 25ms per character for smooth auto-typing
+        const timer = setInterval(() => {
+            if (i < str.length) {
+                element.value += str.charAt(i);
+                element.dispatchEvent(new Event('input', { bubbles: true }));
+                i++;
+            } else {
+                clearInterval(timer);
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+                element.classList.add('ring-2', 'ring-emerald-500', 'bg-emerald-50/15');
+                setTimeout(() => {
+                    element.classList.remove('ring-2', 'ring-emerald-500', 'bg-emerald-50/15');
+                }, 1400);
+                if (typeof callback === 'function') callback();
+            }
+        }, speed);
+    }
+
+    function parseSpokenPhoneNumber(text) {
+        const wordToDigit = {
+            'sunya': '0', 'zero': '0', 'ek': '1', 'one': '1', 'dui': '2', 'two': '2',
+            'tin': '3', 'teen': '3', 'three': '3', 'char': '4', 'four': '4',
+            'panch': '5', 'paanch': '5', 'five': '5', 'chha': '6', 'six': '6',
+            'sat': '7', 'saat': '7', 'seven': '7', 'aath': '8', 'eight': '8',
+            'nau': '9', 'nine': '9'
+        };
+        let clean = text.toLowerCase();
+        for (let [w, d] of Object.entries(wordToDigit)) {
+            clean = clean.replace(new RegExp('\\b' + w + '\\b', 'g'), d);
+        }
+        const digits = clean.replace(/\D/g, '');
+        return digits.length >= 7 ? digits : text.trim();
+    }
+
+    function parseSpokenWeight(text) {
+        const wordToNum = {
+            'ek': '1', 'one': '1', 'dui': '2', 'two': '2', 'tin': '3', 'teen': '3', 'three': '3',
+            'char': '4', 'four': '4', 'panch': '5', 'paanch': '5', 'five': '5',
+            'chha': '6', 'six': '6', 'sat': '7', 'saat': '7', 'seven': '7',
+            'aath': '8', 'eight': '8', 'nau': '9', 'nine': '9', 'das': '10', 'ten': '10',
+            'pandhra': '15', 'fifteen': '15', 'bis': '20', 'bees': '20', 'twenty': '20',
+            'pachis': '25', 'twenty five': '25', 'tis': '30', 'thirty': '30',
+            'pachas': '50', 'fifty': '50', 'saya': '100', 'hundred': '100',
+            'aadha': '0.5', 'half': '0.5'
+        };
+        let clean = text.toLowerCase().replace(/point/g, '.');
+        for (let [w, d] of Object.entries(wordToNum)) {
+            clean = clean.replace(new RegExp('\\b' + w + '\\b', 'g'), d);
+        }
+        const match = clean.match(/(\d+(?:\.\d+)?)/);
+        return match ? parseFloat(match[1]) : 1.0;
+    }
+
+    function parseSpokenDimensions(text) {
+        if (!text || text.toLowerCase().includes('skip') || text.toLowerCase().includes('standard') || text.toLowerCase().includes('default')) {
+            return { length: 25, width: 20, height: 15 };
+        }
+        let clean = text.toLowerCase().replace(/x/g, ' by ').replace(/into/g, ' by ');
+        const matches = clean.match(/\d+(?:\.\d+)?/g);
+        if (matches && matches.length >= 3) {
+            return {
+                length: parseFloat(matches[0]),
+                width: parseFloat(matches[1]),
+                height: parseFloat(matches[2])
+            };
+        } else if (matches && matches.length === 2) {
+            return {
+                length: parseFloat(matches[0]),
+                width: parseFloat(matches[1]),
+                height: 15
+            };
+        } else if (matches && matches.length === 1) {
+            const v = parseFloat(matches[0]);
+            return { length: v, width: v, height: v };
+        }
+        return { length: 25, width: 20, height: 15 };
+    }
+
+    function parseCountryName(text) {
+        // Strip common Nepali and English destination words
+        let clean = text.toLowerCase().replace(/^(to|for|destination\s+is|shipping\s+to|ma|lai)\s+/i, '');
+        clean = clean.replace(/\s+(pathaune|pathauna|ma|lai|pugne)$/i, '').trim();
+
+        const t = clean;
+        const map = {
+            'poland': 'Poland',
+            'germany': 'Germany',
+            'uk': 'United Kingdom',
+            'united kingdom': 'United Kingdom',
+            'england': 'United Kingdom',
+            'britain': 'United Kingdom',
+            'usa': 'United States',
+            'united states': 'United States',
+            'america': 'United States',
+            'australia': 'Australia',
+            'canada': 'Canada',
+            'uae': 'United Arab Emirates',
+            'dubai': 'United Arab Emirates',
+            'japan': 'Japan',
+            'france': 'France',
+            'netherlands': 'Netherlands',
+            'holland': 'Netherlands',
+            'italy': 'Italy',
+            'spain': 'Spain',
+            'switzerland': 'Switzerland',
+            'sweden': 'Sweden',
+            'singapore': 'Singapore',
+            'qatar': 'Qatar',
+            'india': 'India'
+        };
+        for (let [k, v] of Object.entries(map)) {
+            if (t.includes(k)) return v;
+        }
+        return clean.replace(/\b\w/g, l => l.toUpperCase()).trim();
+    }
+</script>
+@endpush

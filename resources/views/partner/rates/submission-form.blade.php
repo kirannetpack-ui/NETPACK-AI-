@@ -1,0 +1,28 @@
+<div class="p-6 space-y-6">
+    @if($errors->any())<div class="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-800"><p class="font-semibold mb-2">Please correct the following:</p><ul class="list-disc pl-5 space-y-1">@foreach($errors->all() as $error)<li>{{ $error }}</li>@endforeach</ul></div>@endif
+    @if($originZones->isEmpty())<div class="rounded-lg border border-amber-200 bg-amber-50 p-4 text-amber-800">Create an approved operating zone before submitting rates.</div>@endif
+
+    <section><h2 class="font-semibold text-gray-900">Route and service</h2><div class="mt-3 grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div><label class="text-sm font-medium">Origin territory *</label><select name="origin_zone_id" required class="mt-1 w-full rounded-lg border-gray-300"><option value="">Select origin</option>@foreach($originZones as $zone)<option value="{{ $zone->id }}" @selected(old('origin_zone_id', $rate->origin_zone_id ?? null) == $zone->id)>{{ $zone->zone_name }}{{ $zone->district ? ' — '.$zone->district : '' }}</option>@endforeach</select></div>
+        <div><label class="text-sm font-medium">Destination territory / hub *</label><select name="destination_zone_id" required class="mt-1 w-full rounded-lg border-gray-300"><option value="">Select destination</option>@foreach($destinationZones as $zone)<option value="{{ $zone->id }}" @selected(old('destination_zone_id', $rate->destination_zone_id ?? null) == $zone->id)>{{ $zone->zone_name }}</option>@endforeach</select><p class="mt-1 text-xs text-gray-500">Kathmandu is listed first when available, but is not mandatory.</p></div>
+        <div><label class="text-sm font-medium">Rate type *</label><select name="rate_type" required class="mt-1 w-full rounded-lg border-gray-300">@foreach($rateTypes as $code => $name)<option value="{{ $code }}" @selected(old('rate_type', $rate->rate_type ?? 'logistics') === $code)>{{ $name }}</option>@endforeach</select></div>
+        <div><label class="text-sm font-medium">Service *</label><select name="service_type" required class="mt-1 w-full rounded-lg border-gray-300">@foreach($services as $code => $name)<option value="{{ $code }}" @selected(old('service_type', $rate->service_type ?? 'standard') === $code)>{{ $name }}</option>@endforeach</select></div>
+    </div></section>
+
+    <section><h2 class="font-semibold text-gray-900">Weight and core charges</h2><div class="mt-3 grid grid-cols-1 md:grid-cols-3 gap-4">
+        @foreach(['weight_from' => 'Weight from (kg)', 'weight_to' => 'Weight to (kg)', 'base_rate' => 'Base rate', 'per_kg_rate' => 'Per kg rate', 'per_km_rate' => 'Per km rate', 'minimum_rate' => 'Minimum charge'] as $field => $label)<div><label class="text-sm font-medium">{{ $label }} {{ in_array($field, ['weight_from','weight_to','base_rate','per_kg_rate']) ? '*' : '' }}</label><input type="number" step="0.01" min="0" name="{{ $field }}" value="{{ old($field, $rate->{$field} ?? 0) }}" {{ in_array($field, ['weight_from','weight_to','base_rate','per_kg_rate']) ? 'required' : '' }} class="mt-1 w-full rounded-lg border-gray-300"></div>@endforeach
+    </div></section>
+
+    <section><h2 class="font-semibold text-gray-900">Pickup and logistics charges</h2><div class="mt-3 grid grid-cols-1 md:grid-cols-3 gap-4">
+        @foreach(['pickup_charge' => 'Pickup charge', 'origin_handling_charge' => 'Origin handling', 'logistical_charge' => 'Inter-zone logistics', 'destination_handling_charge' => 'Destination handling', 'remote_area_surcharge' => 'Remote-area surcharge', 'cod_charge' => 'COD handling'] as $field => $label)<div><label class="text-sm font-medium">{{ $label }}</label><input type="number" step="0.01" min="0" name="{{ $field }}" value="{{ old($field, $rate->{$field} ?? 0) }}" class="mt-1 w-full rounded-lg border-gray-300"></div>@endforeach
+    </div></section>
+
+    <section><h2 class="font-semibold text-gray-900">Validity and SLA</h2><div class="mt-3 grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div><label class="text-sm font-medium">Currency *</label><input name="currency" maxlength="3" required value="{{ old('currency', $rate->currency ?? 'NPR') }}" class="mt-1 w-full rounded-lg border-gray-300 uppercase"></div>
+        <div><label class="text-sm font-medium">Estimated hours</label><input type="number" min="1" name="estimated_hours" value="{{ old('estimated_hours', $rate->estimated_hours ?? '') }}" class="mt-1 w-full rounded-lg border-gray-300"></div>
+        <div><label class="text-sm font-medium">Estimated days</label><input type="number" min="1" name="estimated_days" value="{{ old('estimated_days', $rate->estimated_days ?? '') }}" class="mt-1 w-full rounded-lg border-gray-300"></div>
+        <div><label class="text-sm font-medium">Effective from *</label><input type="date" name="effective_from" required value="{{ old('effective_from', isset($rate) && $rate->effective_from ? $rate->effective_from->format('Y-m-d') : now()->format('Y-m-d')) }}" class="mt-1 w-full rounded-lg border-gray-300"></div>
+        <div><label class="text-sm font-medium">Effective to</label><input type="date" name="effective_to" value="{{ old('effective_to', isset($rate) && $rate->effective_to ? $rate->effective_to->format('Y-m-d') : '') }}" class="mt-1 w-full rounded-lg border-gray-300"></div>
+        <label class="flex items-center gap-2 pt-6"><input type="hidden" name="is_default_destination" value="0"><input type="checkbox" name="is_default_destination" value="1" @checked(old('is_default_destination', $rate->is_default_destination ?? false))><span class="text-sm">Preferred default destination</span></label>
+    </div></section>
+</div>

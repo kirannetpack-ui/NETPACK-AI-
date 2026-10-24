@@ -1,0 +1,51 @@
+﻿1
+00:00:00,000 --> 00:00:14,962
+Welcome to COURIER with NETPACK, a door-to-door logistics technology platform designed to connect customers, merchants, riders, partners, agencies and administrators through one trusted delivery history.
+
+2
+00:00:14,962 --> 00:00:33,748
+Public registration is available for customers, sellers, riders and domestic partners. Administrative, agency and overseas accounts use controlled creation or approval. The assigned role determines dashboard access and data visibility.
+
+3
+00:00:33,748 --> 00:00:52,560
+The platform supports three primary service categories: international courier, domestic courier across Nepal, and e-commerce or on-demand delivery. Supporting services reuse the same identity, tracking and operational controls.
+
+4
+00:00:52,560 --> 00:01:11,806
+International courier starts with origin, destination, parcel measurements and service selection. It continues through rate and surcharge calculation, HAWB and labels, partner scans, unified tracking and exception or delivery completion.
+
+5
+00:01:11,806 --> 00:01:27,888
+Domestic courier uses Nepal-specific addressing, delivery zones and partner rates. A pickup becomes a shipment, moves through a manifest and scan history, and closes with proof of delivery and settlement.
+
+6
+00:01:27,888 --> 00:01:42,065
+Agency and corporate branch access is controlled. Agency administrators manage individual staff accounts, while customer and shipment data remain scoped to the authorized agency.
+
+7
+00:01:42,065 --> 00:01:59,752
+The agency journey begins with controlled access, then customer intake, shipment creation, network handoff, tracking and ongoing customer support. Every staff action remains attributable to the staff member and branch.
+
+8
+00:01:59,752 --> 00:02:16,219
+Tracking numbers, HAWB labels, barcodes and QR codes connect the physical parcel to the digital record. Each authorized scan should validate the shipment and create a traceable custody or status event.
+
+9
+00:02:16,219 --> 00:02:36,470
+Payment and communication complete the service loop. The platform contains payment verification routes, COD and wallet workflows, in-app notifications, chat, support and feedback. Live providers require production credentials and callbacks.
+
+10
+00:02:36,470 --> 00:02:51,467
+Tracking, proof of delivery and COD are the operational control tower. One shipment identity must connect every event, proof record and financial movement without duplicate completion or settlement.
+
+11
+00:02:51,467 --> 00:03:11,879
+Exceptions must never disappear into free text. Failed pickup, transit delay, damage, loss, customs hold, unavailable recipients, wrong addresses and returns each need a reason, owner, next action, notification and service clock.
+
+12
+00:03:11,879 --> 00:03:31,305
+The roadmap begins with reliable deployment and operational controls, then adds carrier integrations, partner scoring, merchant APIs and stronger dispatch, before expanding toward national orchestration, fulfillment, practical AI and regional corridors.
+
+13
+00:03:31,305 --> 00:03:46,972
+COURIER with NETPACK aims to deliver one booking, one connected network and one trusted delivery history. The next step is evidence-based staging validation followed by controlled activation and production promotion.

@@ -1,0 +1,11 @@
+@extends('layouts.app')
+@section('title', 'Assigned Shipment Legs')
+@section('page-title', 'Assigned Shipment Legs')
+@section('content')
+<div class="mx-auto max-w-7xl space-y-5">
+    <div class="rounded-xl border bg-white p-5 shadow-sm"><h1 class="text-xl font-semibold">Pickup and delivery work queue</h1><p class="mt-1 text-sm text-slate-500">Only valid next statuses are accepted. Forwarding is limited to partners approved for this territory, service and leg.</p>@if(session('success'))<div class="mt-3 rounded bg-green-50 p-3 text-green-800">{{ session('success') }}</div>@endif @if($errors->any())<div class="mt-3 rounded bg-red-50 p-3 text-red-800">{{ $errors->first() }}</div>@endif</div>
+    <div class="overflow-x-auto rounded-xl border bg-white shadow-sm"><table class="w-full text-sm"><thead class="bg-slate-50 text-left"><tr><th class="p-3">Tracking</th><th class="p-3">Leg</th><th class="p-3">Route</th><th class="p-3">Status</th><th class="p-3">Update</th></tr></thead><tbody>
+    @forelse($legs as $leg)<tr class="border-t align-top"><td class="p-3 font-mono">{{ $leg->shipment?->tracking_number }}</td><td class="p-3">{{ ucfirst(str_replace('_',' ',$leg->leg_type)) }} #{{ $leg->sequence }}</td><td class="p-3">{{ $leg->origin_name }} → {{ $leg->destination_name }}</td><td class="p-3"><span class="rounded-full bg-blue-50 px-2 py-1 text-blue-800">{{ ucfirst(str_replace('_',' ',$leg->status)) }}</span></td><td class="p-3"><form method="POST" action="{{ route('partner.shipment-legs.status',$leg) }}" class="flex flex-wrap gap-2">@csrf @method('PATCH')<select name="status" required class="rounded border-slate-300 text-xs">@foreach(['accepted','pickup_en_route','picked_up','received','processed','dispatched','in_transit','out_for_delivery','delivery_attempted','completed','exception'] as $status)<option value="{{ $status }}">{{ ucfirst(str_replace('_',' ',$status)) }}</option>@endforeach</select><input name="notes" placeholder="Location / note" class="rounded border-slate-300 text-xs"><button class="rounded bg-teal-600 px-3 py-1.5 font-semibold text-white">Save</button></form></td></tr>
+    @empty<tr><td colspan="5" class="p-8 text-center text-slate-500">No shipment legs are currently assigned.</td></tr>@endforelse</tbody></table><div class="p-4">{{ $legs->links() }}</div></div>
+</div>
+@endsection

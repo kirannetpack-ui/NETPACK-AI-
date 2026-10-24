@@ -1,0 +1,51 @@
+﻿1
+00:00:00,000 --> 00:00:14,962
+Welcome to COURIER with NETPACK, a door-to-door logistics technology platform designed to connect customers, merchants, riders, partners, agencies and administrators through one trusted delivery history.
+
+2
+00:00:14,962 --> 00:00:33,748
+Public registration is available for customers, sellers, riders and domestic partners. Administrative, agency and overseas accounts use controlled creation or approval. The assigned role determines dashboard access and data visibility.
+
+3
+00:00:33,748 --> 00:00:51,900
+E-commerce and on-demand delivery connect seller orders to rider execution. The rider accepts a job, verifies pickup, shares active location, verifies the recipient, handles permitted COD and completes proof of delivery.
+
+4
+00:00:51,900 --> 00:01:12,156
+Professional on-demand operations require both sound pricing and intelligent dispatch. Price considers distance, time, vehicle, parcel, priority and fees, while dispatch considers availability, road time, workload, compatibility and reassignment rules.
+
+5
+00:01:12,156 --> 00:01:28,968
+Riders register with identity, licence and vehicle information. Once approved, they manage availability, jobs, active location, delivery status, COD eligibility, earnings, wallet and deposit history.
+
+6
+00:01:28,968 --> 00:01:45,630
+The rider goes online, accepts an eligible job, navigates to pickup, verifies the parcel, updates transit status, verifies the recipient, collects permitted COD and closes with proof of delivery.
+
+7
+00:01:45,630 --> 00:02:02,097
+Tracking numbers, HAWB labels, barcodes and QR codes connect the physical parcel to the digital record. Each authorized scan should validate the shipment and create a traceable custody or status event.
+
+8
+00:02:02,097 --> 00:02:17,094
+Tracking, proof of delivery and COD are the operational control tower. One shipment identity must connect every event, proof record and financial movement without duplicate completion or settlement.
+
+9
+00:02:17,094 --> 00:02:37,506
+Exceptions must never disappear into free text. Failed pickup, transit delay, damage, loss, customs hold, unavailable recipients, wrong addresses and returns each need a reason, owner, next action, notification and service clock.
+
+10
+00:02:37,506 --> 00:02:57,597
+Nepal serviceability needs province, district, municipality or rural municipality, ward, locality, landmark, GPS pin and reliable phone contacts. The design must also tolerate difficult geography and variable mobile connectivity.
+
+11
+00:02:57,597 --> 00:03:16,513
+Security protects customers, operations and cash. Accounts are approved and role-scoped, high-risk transitions are controlled, sensitive proof and registration data are restricted, and secrets remain outside Git and user-facing materials.
+
+12
+00:03:16,513 --> 00:03:35,939
+The roadmap begins with reliable deployment and operational controls, then adds carrier integrations, partner scoring, merchant APIs and stronger dispatch, before expanding toward national orchestration, fulfillment, practical AI and regional corridors.
+
+13
+00:03:35,939 --> 00:03:51,606
+COURIER with NETPACK aims to deliver one booking, one connected network and one trusted delivery history. The next step is evidence-based staging validation followed by controlled activation and production promotion.

@@ -1,0 +1,52 @@
+1
+00:00:00,000 --> 00:00:14,462
+Welcome to COURIER with NETPACK, a door-to-door logistics technology platform designed to connect customers, merchants, riders, partners, agencies and administrators through one trusted delivery history.
+
+2
+00:00:14,462 --> 00:00:32,753
+Public registration is available for customers, sellers, riders and domestic partners. Administrative, agency and overseas accounts use controlled creation or approval. The assigned role determines dashboard access and data visibility.
+
+3
+00:00:32,753 --> 00:00:48,337
+Domestic courier uses Nepal-specific addressing, delivery zones and partner rates. A pickup becomes a shipment, moves through a manifest and scan history, and closes with proof of delivery and settlement.
+
+4
+00:00:48,337 --> 00:01:04,753
+The current platform can store zones, partners and rates. The future orchestration layer should select the best eligible partner using coverage, price, service level, capacity, performance and COD availability.
+
+5
+00:01:04,753 --> 00:01:21,837
+Remote-area decisions must identify the carrier or data source, the matching condition, the surcharge and the last update date. Official carrier data is preferred, with a clearly labeled manual fallback when live data is unavailable.
+
+6
+00:01:21,837 --> 00:01:37,087
+Domestic partners work within assigned coverage, rates, manifests, deliveries and staff permissions. In-app notifications provide a fallback when no live partner integration is configured.
+
+7
+00:01:37,087 --> 00:01:52,378
+A partner receives a manifest, scans and processes shipments, dispatches them for delivery, captures proof or an exception, and may forward or re-manifest only with authorization and a complete audit history.
+
+8
+00:01:52,378 --> 00:02:08,345
+Tracking numbers, HAWB labels, barcodes and QR codes connect the physical parcel to the digital record. Each authorized scan should validate the shipment and create a traceable custody or status event.
+
+9
+00:02:08,345 --> 00:02:22,845
+Tracking, proof of delivery and COD are the operational control tower. One shipment identity must connect every event, proof record and financial movement without duplicate completion or settlement.
+
+10
+00:02:22,845 --> 00:02:42,762
+Exceptions must never disappear into free text. Failed pickup, transit delay, damage, loss, customs hold, unavailable recipients, wrong addresses and returns each need a reason, owner, next action, notification and service clock.
+
+11
+00:02:42,762 --> 00:03:02,353
+Nepal serviceability needs province, district, municipality or rural municipality, ward, locality, landmark, GPS pin and reliable phone contacts. The design must also tolerate difficult geography and variable mobile connectivity.
+
+12
+00:03:02,353 --> 00:03:21,279
+The roadmap begins with reliable deployment and operational controls, then adds carrier integrations, partner scoring, merchant APIs and stronger dispatch, before expanding toward national orchestration, fulfillment, practical AI and regional corridors.
+
+13
+00:03:21,279 --> 00:03:36,446
+COURIER with NETPACK aims to deliver one booking, one connected network and one trusted delivery history. The next step is evidence-based staging validation followed by controlled activation and production promotion.
+

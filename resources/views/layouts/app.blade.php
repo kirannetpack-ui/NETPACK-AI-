@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>@yield('title', config('app.name'))</title>
+    <!-- PWA & Mobile Meta Tags -->
+    <link rel="manifest" href="/manifest.json">
+    <meta name="theme-color" content="#142b3a">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="apple-mobile-web-app-title" content="NETPACK AI">
+    <link rel="apple-touch-icon" href="/images/logo-icon.png">
+    <meta name="mobile-web-app-capable" content="yes">
+
+    @vite(['resources/css/app.css', 'resources/js/app.js'])
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
+    <style>
+        @media (min-width: 1024px) {
+            .netpack-sidebar { position: sticky; top: 0; transform: none !important; margin-left: 0 !important; align-self: flex-start; }
+        }
+    </style>
+    @stack('styles')
+</head>
+<body class="np-system netpack-workspace">
+<a href="#main-content" class="np-skip">Skip to content</a>
+<div x-data="{ 
+        sidebarOpen: false,
+        toggleSidebar() {
+            this.sidebarOpen = !this.sidebarOpen;
+        }
+     }" 
+     @keydown.escape.window="sidebarOpen = false" class="flex min-h-screen bg-slate-50 relative overflow-x-hidden">
+        <!-- Sidebar: Always displayed for all users at all times -->
+        @php
+            $sidebar = 'layouts.partials.customer-sidebar';
+            
+            if (auth()->check()) {
+                $user = auth()->user();
+                // Determine sidebar based on user type and service scope
+                if ($user->isSuperAdmin() || $user->user_type === 'admin') {
+                    $sidebar = 'layouts.partials.admin-sidebar';
+                } elseif ($user->user_type === 'staff') {
+                    $scope = $user->effectiveServiceScope();
+                    if ($scope === 'international') {
+                        $sidebar = 'layouts.partials.international-sidebar';
+                    } elseif ($scope === 'domestic' || $scope === 'ecommerce') {
+                        $sidebar = 'layouts.partials.domestic-sidebar';
+                    } else {
+                        // Super Admin created staff sees all services and underneath
+                        $sidebar = 'layouts.partials.admin-sidebar';
+                    }
+                } elseif ($user->isDomesticAdmin()) {
+                    $sidebar = 'layouts.partials.domestic-sidebar';
+                } elseif ($user->isInternationalAdmin() || $user->user_type === 'overseas') {
+                    $sidebar = 'layouts.partials.international-sidebar';
+                } elseif ($user->isPartner()) {
+                    $sidebar = 'layouts.partials.partner-sidebar';
+                } elseif ($user->isSeller()) {
+                    $sidebar = 'layouts.partials.seller-sidebar';
+                } elseif ($user->isRider()) {
+                    $sidebar = 'layouts.partials.rider-sidebar';
+                } elseif ($user->isCustomer() || (method_exists($user, 'isClient') && $user->isClient())) {
+                    $sidebar = 'layouts.partials.customer-sidebar';
+                } else {
+                    $sidebar = 'layouts.partials.customer-sidebar';
+                }
+            }
+        @endphp
+        @include($sidebar)
+
+        <!-- Mobile Backdrop Overlay -->
+        <div x-show="sidebarOpen" 
+             @click="sidebarOpen = false" 
+             x-transition:enter="transition-opacity ease-linear duration-200"
+             x-transition:enter-start="opacity-0"
+             x-transition:enter-end="opacity-100"
+             x-transition:leave="transition-opacity ease-linear duration-200"
+             x-transition:leave-start="opacity-100"
+             x-transition:leave-end="opacity-0"
+             class="fixed inset-0 z-40 bg-slate-900/50 backdrop-blur-xs lg:hidden"
+             style="display: none;"></div>
+
+        <!-- Main Content -->
+        <main class="flex-1 min-w-0 overflow-y-auto transition-all duration-300">
+            <!-- Top Bar -->
+            @include('layouts.partials.header')
+
+            <!-- Page Content -->
+            <div class="p-4 sm:p-6" id="main-content">
+                @if(session('success'))
+                    <div class="bg-green-100 border border-green-400 text-green-700 px-4 py-3 rounded-lg mb-4">
+                        {{ session('success') }}
+                    </div>
+                @endif
+
+                @if(session('error'))
+                    <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-lg mb-4">
+                        {{ session('error') }}
+                    </div>
+                @endif
+
+                @if(session('info'))
+                    <div class="bg-blue-100 border border-blue-400 text-blue-700 px-4 py-3 rounded-lg mb-4">
+                        {{ session('info') }}
+                    </div>
+                @endif
+
+                @yield('content')
+            </div>
+        </main>
+    </div>
+
+    <!-- Omnipresent AI Logistics Copilot (Voice & Text) -->
+    <x-ai-copilot-widget />
+
+    <!-- PWA Install Banner Component -->
+    <x-pwa-install-banner />
+
+    <!-- PWA Service Worker Registration & App Install Handler -->
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('/service-worker.js')
+                    .then((reg) => console.log('[PWA] Service Worker registered with scope:', reg.scope))
+                    .catch((err) => console.warn('[PWA] Service Worker registration failed:', err));
+            });
+        }
+
+        // Global PWA Install Prompt Handler
+        let deferredPrompt;
+        window.addEventListener('beforeinstallprompt', (e) => {
+            e.preventDefault();
+            deferredPrompt = e;
+            window.dispatchEvent(new CustomEvent('pwa-installable'));
+        });
+        window.installNetpackApp = async () => {
+            if (deferredPrompt) {
+                deferredPrompt.prompt();
+                const { outcome } = await deferredPrompt.userChoice;
+                console.log(`[PWA] User response to install prompt: ${outcome}`);
+                deferredPrompt = null;
+            }
+        };
+    </script>
+
+    @stack('scripts')
+</body>
+</html>

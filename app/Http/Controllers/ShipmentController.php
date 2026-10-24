@@ -1,0 +1,1110 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Agency;
+use App\Models\LastMileCarrier;
+use App\Models\OverseasHub;
+use App\Models\Shipment;
+use App\Models\DeliveryZone;
+use App\Models\PickupRequest;
+use App\Models\LogisticsService;
+use App\Models\User;
+use App\Notifications\DomesticPickupAssignedNotification;
+use App\Services\DomesticOperationsNotificationService;
+use App\Services\DomesticRateQuoteService;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Validator;
+
+class ShipmentController extends Controller
+{
+    /**
+     * Display a listing of shipments.
+     */
+    public function index(Request $request)
+{
+    $user = Auth::user();
+    
+    $query = Shipment::query();
+    
+    // =============================================
+    // ROLE-BASED FILTERING
+    // =============================================
+    
+    if ($user->isSuperAdmin() || $user->user_type === 'admin') {
+        // Super Admin: See ALL shipments
+        // No filter needed
+        
+    } elseif ($user->isDomesticAdmin()) {
+        // Domestic Admin: See DOMESTIC + E-COMMERCE only
+        $query->whereIn('shipment_type', ['domestic', 'ecommerce']);
+        
+    } elseif ($user->isInternationalAdmin()) {
+        // International Admin: See INTERNATIONAL only
+        $query->where('shipment_type', 'international');
+        
+    } elseif ($user->isSeller()) {
+        // Seller: See only their own shipments
+        $query->where('seller_id', $user->id);
+        
+    } elseif ($user->isRider()) {
+        // Rider: See only assigned shipments
+        $query->where('rider_id', $user->id);
+        
+    } elseif ($user->isPartner()) {
+        // Partner: canonical assignment is recorded per shipment leg.
+        $query->whereHas('legs', fn ($legs) => $legs->where('partner_id', $user->id));
+        
+    } elseif ($user->isCustomer() || $user->user_type === 'client') {
+        // Client / Customer: See strictly their own shipments
+        $query->where(function ($q) use ($user) {
+            $q->where('customer_id', $user->id)
+              ->orWhere(function ($sub) use ($user) {
+                  $sub->where('seller_id', $user->id)->whereNull('customer_id');
+              });
+        });
+    }
+
+    // Role-scoped base query for accurate user statistics
+    $scopedBase = clone $query;
+    
+    // Search filter
+    if ($request->has('search') && $request->search) {
+        $search = $request->search;
+        $query->where(function($q) use ($search) {
+            $q->where('tracking_number', 'LIKE', "%{$search}%")
+              ->orWhere('receiver_name', 'LIKE', "%{$search}%")
+              ->orWhere('sender_name', 'LIKE', "%{$search}%")
+              ->orWhere('hawb_number', 'LIKE', "%{$search}%");
+        });
+    }
+    
+    // Status filter
+    if ($request->has('status') && $request->status) {
+        if ($request->status === 'ongoing') {
+            $query->whereNotIn('status', ['delivered', 'cancelled', 'returned']);
+        } else {
+            $query->where('status', $request->status);
+        }
+    }
+    
+    // Shipment type filter
+    if ($request->has('shipment_type') && $request->shipment_type) {
+        $query->where('shipment_type', $request->shipment_type);
+    }
+    
+    $shipments = $query->orderBy('created_at', 'desc')->paginate(20);
+    
+    // Calculate user-scoped statistics
+    $stats = [
+        'total' => (clone $scopedBase)->count(),
+        'pending' => (clone $scopedBase)->where('status', 'pending')->count(),
+        'in_transit' => (clone $scopedBase)->whereIn('status', ['picked_up', 'in_transit', 'out_for_delivery'])->count(),
+        'delivered' => (clone $scopedBase)->where('status', 'delivered')->count(),
+        'cancelled' => (clone $scopedBase)->where('status', 'cancelled')->count(),
+    ];
+    
+    return view('shipments.index', compact('shipments', 'stats'));
+}
+
+
+    /**
+     * Show the form for creating a new shipment / Unified Operating Console.
+     */
+    public function create(Request $request = null)
+    {
+        $request = $request ?? request();
+        $user = Auth::user();
+        $hubs = OverseasHub::active()->with('agencies')->orderBy('sort_order')->get();
+        $agencies = Agency::where('is_active', true)->get();
+        $carriers = LastMileCarrier::active()->orderBy('sort_order')->get();
+        $domesticZones = DeliveryZone::active()
+            ->where(function ($query) {
+                $query->where('approval_status', 'approved')->orWhereNull('approval_status');
+            })
+            ->orderByRaw("CASE WHEN zone_name LIKE '%Kathmandu%' THEN 0 ELSE 1 END")
+            ->orderBy('zone_name')
+            ->get();
+        $domesticServices = \App\Models\DomesticRate::getServiceTypeOptions();
+
+        // Saved addresses and recent pickup inquiries for rapid prefill
+        $savedAddresses = $user ? $user->savedAddresses()->orderByDesc('is_default')->orderByDesc('last_used_at')->get() : collect();
+        $recentPickups = $user ? PickupRequest::where('seller_id', $user->id)->latest()->take(10)->get() : collect();
+
+        // Status counts for active pickups & queue tracking
+        $pickupStatusCounts = [
+            'all' => $user ? PickupRequest::where('seller_id', $user->id)->count() : 0,
+            'pending' => $user ? PickupRequest::where('seller_id', $user->id)->where('status', 'pending')->count() : 0,
+            'assigned' => $user ? PickupRequest::where('seller_id', $user->id)->where('status', 'assigned')->count() : 0,
+            'picked_up' => $user ? PickupRequest::where('seller_id', $user->id)->where('status', 'picked_up')->count() : 0,
+            'in_transit' => $user ? PickupRequest::where('seller_id', $user->id)->where('status', 'in_transit')->count() : 0,
+            'delivered' => $user ? PickupRequest::where('seller_id', $user->id)->where('status', 'delivered')->count() : 0,
+        ];
+
+        // Active dispatches queue for unified console split-pane
+        $activePickups = $user ? PickupRequest::where('seller_id', $user->id)->with(['rider', 'partner'])->latest()->take(25)->get() : collect();
+        $activeShipments = $user ? Shipment::where('customer_id', $user->id)->orWhere('seller_id', $user->id)->latest()->take(25)->get() : collect();
+
+        // Convert existing pickup request into full consignment pre-fill
+        $convertPickup = null;
+        $convertPickupId = $request ? $request->input('convert_pickup_id') : request('convert_pickup_id');
+        if ($convertPickupId && $user) {
+            $convertPickup = PickupRequest::where('seller_id', $user->id)->find($convertPickupId)
+                ?? PickupRequest::find($convertPickupId);
+        }
+
+        return view('shipments.create', compact(
+            'hubs', 'agencies', 'carriers', 'domesticZones', 'domesticServices',
+            'savedAddresses', 'recentPickups', 'pickupStatusCounts', 'activePickups', 'activeShipments', 'convertPickup'
+        ));
+    }
+
+    /**
+     * Store a newly created shipment.
+     */
+    public function store(Request $request)
+    {
+        $isDoorstep = $request->has('schedule_doorstep_pickup')
+            ? $request->boolean('schedule_doorstep_pickup')
+            : true;
+
+        $validator = Validator::make($request->all(), [
+            'shipment_type' => 'required|in:domestic,international,ecommerce',
+            'service_type' => 'required_if:shipment_type,domestic',
+            'pickup_name' => 'nullable|array',
+            'pickup_name.*' => 'nullable|string|max:255',
+            'pickup_phone' => 'nullable|array',
+            'pickup_phone.*' => 'nullable|string|max:20',
+            'pickup_address' => 'nullable|array',
+            'pickup_address.*' => 'nullable|string',
+            'weight' => 'required|numeric|min:0.1',
+            'description' => 'nullable|string',
+            'origin_zone_id' => 'nullable|exists:delivery_zones,id',
+            'destination_zone_id' => 'nullable|exists:delivery_zones,id',
+            'seller_bill_file' => 'nullable|file|mimes:pdf,jpg,jpeg,png,webp|max:10240',
+            'seller_bill_type' => 'nullable|string|max:50',
+            'seller_bill_number' => 'nullable|string|max:100',
+            'invoice_data_json' => 'nullable|string',
+            'packing_list_data_json' => 'nullable|string',
+            'acquisition_source' => 'nullable|string|max:100',
+            'cost_amount' => 'nullable|numeric|min:0',
+        ]);
+
+        if ($isDoorstep) {
+            $validator->addRules([
+                'pickup_address' => 'required|array',
+                'pickup_address.0' => 'required|string',
+            ]);
+        }
+
+        // International specific validation
+        if ($request->shipment_type === 'international') {
+            $validator->addRules([
+                'receiver_name' => 'required|string|max:255',
+                'receiver_street' => 'required|string|max:255',
+                'receiver_city' => 'required|string|max:100',
+                'receiver_state' => 'nullable|string|max:100',
+                'receiver_postal_code' => 'nullable|string|max:20',
+                'receiver_country' => 'required|string|max:100',
+            ]);
+        } else {
+            // Domestic/E-commerce validation
+            $validator->addRules([
+                'delivery_name' => 'required|array',
+                'delivery_name.*' => 'required|string|max:255',
+                'delivery_phone' => 'required|array',
+                'delivery_phone.*' => 'required|string|max:20',
+                'delivery_address' => 'required|array',
+                'delivery_address.*' => 'required|string',
+            ]);
+        }
+
+        if ($validator->fails()) {
+            return redirect()->back()
+                ->withErrors($validator)
+                ->withInput();
+        }
+
+        // Get the first pickup / sender for main fields
+        $user = Auth::user();
+        $firstPickup = $request->input('pickup_name.0') ?: ($request->input('sender_name') ?: ($user->name ?? 'Sender'));
+        $firstPickupPhone = $request->input('pickup_phone.0') ?: ($request->input('sender_phone') ?: ($user->phone ?? 'N/A'));
+        $firstPickupAddress = $request->input('pickup_address.0') ?: ($request->input('sender_address') ?: ($user->permanent_address ?? ($user->address ?? 'Netpack Station Drop-off')));
+
+        // Generate tracking and HAWB numbers for all shipment types
+        $trackingNumber = $this->generateTrackingNumber($request->service_type, $request->shipment_type);
+        $destinationRef = $request->shipment_type === 'international'
+            ? $request->receiver_country
+            : ($request->receiver_city ?? ($request->input('delivery_address.0') ?? 'Nepal'));
+        $hawbNumber = $this->generateHAWBNumber($request->shipment_type, $destinationRef);
+
+        // Auto-resolve origin and destination zones if omitted by client
+        $originZoneId = $request->origin_zone_id;
+        $destinationZoneId = $request->destination_zone_id;
+
+        if (!$originZoneId) {
+            $originZoneId = DeliveryZone::where('is_active', true)
+                ->where(function ($q) {
+                    $q->where('approval_status', 'approved')->orWhereNull('approval_status');
+                })
+                ->where(function ($q) {
+                    $q->where('zone_name', 'like', '%Kathmandu%')->orWhere('district', 'like', '%Kathmandu%');
+                })
+                ->value('id')
+                ?? DeliveryZone::where('is_active', true)->value('id');
+        }
+
+        if (!$destinationZoneId && $originZoneId) {
+            $destinationZoneId = DeliveryZone::where('is_active', true)
+                ->where(function ($q) {
+                    $q->where('approval_status', 'approved')->orWhereNull('approval_status');
+                })
+                ->where('id', '!=', $originZoneId)
+                ->value('id');
+        }
+
+        $domesticPlan = null;
+        if ($request->shipment_type === 'domestic' && $originZoneId && $destinationZoneId) {
+            $domesticPlan = app(DomesticRateQuoteService::class)->quote(
+                (int) $originZoneId,
+                (int) $destinationZoneId,
+                (string) $request->service_type,
+                (float) $request->weight,
+                null,
+                $request->boolean('is_cod')
+            );
+        } elseif ($request->shipment_type === 'international' && $originZoneId && $destinationZoneId) {
+            // International bookings include the domestic first-mile movement to the selected gateway.
+            $domesticPlan = app(DomesticRateQuoteService::class)->quote(
+                (int) $originZoneId,
+                (int) $destinationZoneId,
+                'standard',
+                (float) $request->weight
+            );
+        }
+
+        // Customer price is derived from approved partner cost plus the admin margin.
+        if ($request->shipment_type === 'domestic') {
+            $domesticPrice = (float) ($domesticPlan['customer_price'] ?? 0);
+            $rate = $domesticPrice > 0 ? $domesticPrice : $this->calculateRate($request);
+        } elseif ($request->shipment_type === 'international') {
+            $rate = $this->calculateRate($request) + (float) ($domesticPlan['customer_price'] ?? 0);
+        } else {
+            $rate = $this->calculateRate($request);
+        }
+
+        DB::beginTransaction();
+        try {
+
+        $shipment = new Shipment();
+        $shipment->hawb_number = $hawbNumber;
+        $shipment->tracking_number = $trackingNumber;
+        $shipment->customer_id = Auth::id();
+        $shipment->service_type = $request->service_type ?? 'standard';
+        $shipment->shipment_type = $request->shipment_type;
+        
+        // Sender (from profile)
+        $user = Auth::user();
+        $shipment->sender_name = $user->name;
+        $shipment->sender_phone = $user->phone ?? 'N/A';
+        $shipment->sender_address = $user->permanent_address ?? $firstPickupAddress;
+        $shipment->sender_city = $user->city ?? 'Kathmandu';
+        $shipment->sender_country = 'Nepal';
+        $shipment->sender_lat = $user->address_lat;
+        $shipment->sender_lng = $user->address_lng;
+
+        // Receiver based on shipment type
+        if ($request->shipment_type === 'international') {
+            // International: Single receiver with 5-line format
+            $shipment->receiver_name = $request->receiver_name;
+            $shipment->receiver_phone = $request->receiver_phone ?? 'N/A';
+            $shipment->receiver_address = $request->receiver_street;
+            $shipment->receiver_city = $request->receiver_city;
+            $shipment->receiver_state = $request->receiver_state;
+            $shipment->receiver_postal_code = $request->receiver_postal_code;
+            $shipment->receiver_country = $request->receiver_country;
+            $shipment->receiver_tax_id = $request->receiver_tax_id;
+            $shipment->receiver_company = $request->receiver_company;
+            
+            // Store full address for display
+            $fullAddress = $request->receiver_name . "\n" .
+                          $request->receiver_street . "\n" .
+                          $request->receiver_city . ", " . $request->receiver_state . "\n" .
+                          $request->receiver_postal_code . "\n" .
+                          $request->receiver_country;
+            $shipment->receiver_address = $fullAddress;
+            
+            // Multiple delivery points for international (if provided) or single 5-line format
+            if (is_array($request->delivery_name) && count($request->delivery_name) > 0 && !empty($request->delivery_name[0])) {
+                $deliveryPoints = [];
+                for ($i = 0; $i < count($request->delivery_name); $i++) {
+                    $deliveryPoints[] = [
+                        'name' => $request->delivery_name[$i],
+                        'phone' => $request->delivery_phone[$i] ?? 'N/A',
+                        'address' => $request->delivery_address[$i] ?? '',
+                        'city' => $request->receiver_city ?? '',
+                        'country' => $request->receiver_country ?? '',
+                        'lat' => $request->delivery_lat[$i] ?? null,
+                        'lng' => $request->delivery_lng[$i] ?? null,
+                    ];
+                }
+                $shipment->delivery_points = $deliveryPoints;
+            } else {
+                $shipment->delivery_points = [
+                    [
+                        'name' => $request->receiver_name,
+                        'phone' => $request->receiver_phone ?? 'N/A',
+                        'address' => $fullAddress,
+                        'city' => $request->receiver_city,
+                        'state' => $request->receiver_state,
+                        'postal_code' => $request->receiver_postal_code,
+                        'country' => $request->receiver_country,
+                    ]
+                ];
+            }
+            
+        } else {
+            // Domestic/E-commerce: Multiple delivery points
+            $firstDelivery = $request->delivery_name[0] ?? '';
+            $firstDeliveryPhone = $request->delivery_phone[0] ?? '';
+            $firstDeliveryAddress = $request->delivery_address[0] ?? '';
+            $firstDeliveryDistrict = is_array($request->delivery_district) ? ($request->delivery_district[0] ?? null) : $request->delivery_district;
+            $firstDeliveryProvince = is_array($request->delivery_province) ? ($request->delivery_province[0] ?? null) : $request->delivery_province;
+
+            $shipment->receiver_name = $firstDelivery;
+            $shipment->receiver_phone = $firstDeliveryPhone;
+            $shipment->receiver_address = $firstDeliveryAddress;
+            $shipment->receiver_city = $firstDeliveryDistrict ?: ($request->receiver_city ?? 'Kathmandu');
+            $shipment->receiver_state = $firstDeliveryProvince ?: ($request->receiver_state ?? 'Bagmati');
+            $shipment->receiver_country = $request->receiver_country ?? 'Nepal';
+
+            // Multiple delivery points
+            $deliveryPoints = [];
+            for ($i = 0; $i < count($request->delivery_name); $i++) {
+                $deliveryPoints[] = [
+                    'name' => $request->delivery_name[$i],
+                    'phone' => $request->delivery_phone[$i],
+                    'address' => $request->delivery_address[$i],
+                    'district' => is_array($request->delivery_district) ? ($request->delivery_district[$i] ?? null) : null,
+                    'province' => is_array($request->delivery_province) ? ($request->delivery_province[$i] ?? null) : null,
+                    'lat' => $request->delivery_lat[$i] ?? null,
+                    'lng' => $request->delivery_lng[$i] ?? null,
+                ];
+            }
+            $shipment->delivery_points = $deliveryPoints;
+        }
+
+        // Multiple pickup points for ALL shipment types (Domestic, International, E-Commerce)
+        $pickupPoints = [];
+        if (is_array($request->pickup_name)) {
+            for ($i = 0; $i < count($request->pickup_name); $i++) {
+                if (!empty($request->pickup_name[$i]) || !empty($request->pickup_address[$i])) {
+                    $pickupPoints[] = [
+                        'name' => $request->pickup_name[$i] ?? $firstPickup,
+                        'phone' => $request->pickup_phone[$i] ?? $firstPickupPhone,
+                        'address' => $request->pickup_address[$i] ?? $firstPickupAddress,
+                        'lat' => $request->pickup_lat[$i] ?? null,
+                        'lng' => $request->pickup_lng[$i] ?? null,
+                    ];
+                }
+            }
+        }
+        if (empty($pickupPoints) && $firstPickup) {
+            $pickupPoints[] = [
+                'name' => $firstPickup,
+                'phone' => $firstPickupPhone,
+                'address' => $firstPickupAddress,
+            ];
+        }
+        $shipment->pickup_points = $pickupPoints;
+
+        // Auto-save newly entered pickup addresses to user's address book
+        if ($request->boolean('save_pickup_addresses', true) && $user) {
+            foreach ($pickupPoints as $pPoint) {
+                if (!empty($pPoint['address']) && !str_contains(strtolower($pPoint['address']), 'station drop-off')) {
+                    $sAddr = \App\Models\SavedAddress::firstOrNew([
+                        'user_id' => $user->id,
+                        'address' => $pPoint['address'],
+                    ]);
+                    $sAddr->contact_person_name = $pPoint['name'] ?? $user->name;
+                    $sAddr->contact_person_phone = $pPoint['phone'] ?? ($user->phone ?? '9800000000');
+                    if (empty($sAddr->label)) {
+                        $sAddr->label = 'Pickup Location #' . ($user->savedAddresses()->count() + 1);
+                    }
+                    $sAddr->recordUsage();
+                }
+            }
+        }
+
+        // Package details & precision air cargo weight calculation
+        $grossWeight = max(0.1, (float) $request->weight);
+        $length = $request->filled('length') ? (float)$request->length : null;
+        $width = $request->filled('width') ? (float)$request->width : null;
+        $height = $request->filled('height') ? (float)$request->height : null;
+
+        if ($request->shipment_type === 'international') {
+            $weightInfo = app(\App\Services\InternationalRateService::class)->calculateWeight(
+                $grossWeight, $length, $width, $height
+            );
+            $shipment->actual_weight = $weightInfo['gross_weight'];
+            $shipment->volumetric_weight = $weightInfo['volumetric_weight'];
+            $shipment->chargeable_weight = $weightInfo['chargeable_weight'];
+        } else {
+            $shipment->actual_weight = $grossWeight;
+            $shipment->chargeable_weight = $grossWeight;
+        }
+
+        $shipment->length = $length;
+        $shipment->width = $width;
+        $shipment->height = $height;
+        $shipment->description = $request->description;
+        $shipment->package_type = $request->package_type ?? 'parcel';
+
+        // Pricing
+        $shipment->shipping_cost = $rate;
+        $shipment->handling_fee = 0;
+        $shipment->insurance_fee = 0;
+        $shipment->total_amount = $rate;
+        $shipment->discount = 0;
+
+        // E-commerce specific
+        if ($request->shipment_type === 'ecommerce') {
+            $shipment->order_id = $request->order_id;
+            $shipment->store_name = $request->store_name;
+        }
+
+        // Cash On Delivery (COD) handling for Domestic & E-Commerce
+        $isCod = $request->boolean('is_cod') || (float) $request->input('cod_amount', 0) > 0;
+        $shipment->is_cod = $isCod;
+        $shipment->cod_amount = $isCod ? (float) $request->input('cod_amount', 0) : 0;
+        if ($isCod) {
+            $shipment->payment_method = 'cod';
+        }
+
+        // Status
+        $shipment->status = 'pending';
+        $shipment->payment_status = $isCod ? 'pending' : 'pending';
+
+        // Tracking timeline & structured history
+        $shipment->tracking_timeline = [
+            [
+                'status' => 'pending',
+                'note' => 'Shipment created',
+                'timestamp' => now()->toDateTimeString()
+            ]
+        ];
+
+        $originCity = $request->sender_city ?: 'Kathmandu';
+        $serviceLabel = strtoupper($request->service_type ?? 'STANDARD');
+        $shipment->tracking_history = [
+            [
+                'event_code' => 'booking_confirmed',
+                'status' => 'confirmed',
+                'status_label' => 'Booking Confirmed',
+                'icon' => 'fa-circle-check',
+                'description' => "Consignment booking registered in system. Scheduled for {$serviceLabel} logistics corridor.",
+                'location' => $originCity . ', Nepal',
+                'time' => now()->toIso8601String(),
+                'scan_source' => 'booking_creation_automation',
+                'scanned_by_user_id' => $user?->id ?? 1,
+                'scanned_by_role' => $user?->user_type ?? 'client',
+                'meta' => [
+                    'weight' => $grossWeight,
+                    'service' => $request->service_type ?? 'standard',
+                ],
+            ]
+        ];
+
+        // Estimated delivery & routing assignment (defined by admin post-booking)
+        if ($request->shipment_type === 'international') {
+            if ($request->service_type === 'express') {
+                $shipment->estimated_delivery = now()->addDays(4);
+            } else {
+                $shipment->estimated_delivery = now()->addDays(8);
+            }
+            $shipment->last_mile_carrier_name = null;
+            $shipment->current_hub_id = null;
+            $shipment->current_agency_id = null;
+            $shipment->customs_mode = 'DDP';
+            $shipment->agency_milestone = 'pending_admin_routing';
+        } else {
+            $shipment->estimated_delivery = now()->addDays(3);
+        }
+
+        // Process Seller Bill / VAT / PAN Document Upload (Nepal Government Compliance)
+        if ($request->hasFile('seller_bill_file')) {
+            $billFile = $request->file('seller_bill_file');
+            $billPath = $billFile->store('shipment_documents', 'public');
+            $shipment->seller_bill_file = $billPath;
+        }
+
+        // Process Commercial Invoice Data
+        $invoiceData = null;
+        if ($request->filled('invoice_data_json')) {
+            $decoded = json_decode($request->input('invoice_data_json'), true);
+            if (is_array($decoded)) {
+                $invoiceData = $decoded;
+            }
+        }
+        if (!$invoiceData && ($request->filled('invoice_number') || $request->has('items_description'))) {
+            $invoiceData = [
+                'invoice_number' => $request->input('invoice_number'),
+                'invoice_date' => $request->input('invoice_date', date('Y-m-d')),
+                'currency' => $request->input('invoice_currency', $request->shipment_type === 'international' ? 'USD' : 'NPR'),
+                'incoterm' => $request->input('incoterm', 'DAP'),
+                'export_reason' => $request->input('reason_for_export', 'Commercial Sale / Export'),
+                'shipper_pan_vat' => $request->input('exporter_pan_vat', $user->pan_vat_number ?? $user->pan_number ?? ''),
+                'shipper_exim_code' => $request->input('exporter_exim_code', $user->exim_code ?? ''),
+                'consignee_tax_id' => $request->input('consignee_tax_id', $shipment->receiver_tax_id ?? ''),
+                'items' => [],
+            ];
+            if (is_array($request->input('items_description'))) {
+                foreach ($request->input('items_description') as $idx => $desc) {
+                    $qty = (float) ($request->input("items_qty.{$idx}") ?? 1);
+                    $price = (float) ($request->input("items_price.{$idx}") ?? 0);
+                    $invoiceData['items'][] = [
+                        'description' => $desc,
+                        'hs_code' => $request->input("items_hs_code.{$idx}") ?? '',
+                        'origin_country' => 'Nepal',
+                        'quantity' => $qty,
+                        'uom' => $request->input("items_uom.{$idx}") ?? 'PCS',
+                        'unit_value' => $price,
+                        'total_value' => $qty * $price,
+                    ];
+                }
+            }
+        }
+        if ($invoiceData) {
+            if ($request->filled('seller_bill_type')) {
+                $invoiceData['seller_bill_type'] = $request->input('seller_bill_type');
+            }
+            if ($request->filled('seller_bill_number')) {
+                $invoiceData['seller_bill_number'] = $request->input('seller_bill_number');
+            }
+            $shipment->invoice_data = $invoiceData;
+        }
+
+        // Process Packing List Data & Box Specifications
+        $packingListData = null;
+        if ($request->filled('packing_list_data_json')) {
+            $decodedP = json_decode($request->input('packing_list_data_json'), true);
+            if (is_array($decodedP)) {
+                $packingListData = $decodedP;
+            }
+        }
+        if ($packingListData) {
+            // Strict Validation: Items packed across boxes must not exceed total quantity entered in invoice
+            if (!empty($packingListData['boxes']) && $invoiceData && !empty($invoiceData['items'])) {
+                $declaredItems = $invoiceData['items'];
+                $packedTotals = [];
+
+                foreach ($packingListData['boxes'] as $b) {
+                    $bItems = $b['items'] ?? [];
+                    foreach ($bItems as $bItem) {
+                        $pQty = (float) ($bItem['quantity'] ?? ($bItem['qty'] ?? 0));
+                        if ($pQty <= 0) {
+                            continue;
+                        }
+
+                        $matchedIdx = null;
+                        if (isset($bItem['item_index']) && isset($declaredItems[$bItem['item_index']])) {
+                            $matchedIdx = (int) $bItem['item_index'];
+                        } else {
+                            $bName = trim(strtolower($bItem['item_name'] ?? ($bItem['description'] ?? '')));
+                            $bHs = trim($bItem['hs_code'] ?? '');
+                            foreach ($declaredItems as $dIdx => $dItem) {
+                                $dName = trim(strtolower($dItem['description'] ?? ($dItem['name'] ?? '')));
+                                $dHs = trim($dItem['hs_code'] ?? '');
+                                if (($bHs !== '' && $bHs === $dHs) || ($bName !== '' && $bName === $dName)) {
+                                    $matchedIdx = $dIdx;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if ($matchedIdx !== null) {
+                            $packedTotals[$matchedIdx] = ($packedTotals[$matchedIdx] ?? 0) + $pQty;
+                        }
+                    }
+                }
+
+                foreach ($declaredItems as $dIdx => $dItem) {
+                    $declaredQty = (float) ($dItem['quantity'] ?? ($dItem['qty'] ?? 0));
+                    $packedQty = (float) ($packedTotals[$dIdx] ?? 0);
+                    $itemName = $dItem['description'] ?? ($dItem['name'] ?? 'Item #' . ($dIdx + 1));
+
+                    if ($packedQty > ($declaredQty + 0.0001)) {
+                        DB::rollBack();
+                        $errMsg = "The packing list quantity for '{$itemName}' ({$packedQty}) exceeds the total quantity entered in the invoice ({$declaredQty}). Total items packed cannot exceed entered quantity.";
+                        if ($request->expectsJson()) {
+                            return response()->json([
+                                'success' => false,
+                                'message' => $errMsg,
+                            ], 422);
+                        }
+                        return redirect()->back()
+                            ->withErrors(['packing_list_data_json' => $errMsg])
+                            ->withInput();
+                    }
+                }
+            }
+
+            $shipment->packing_list_data = $packingListData;
+            $shipment->boxes = $packingListData['boxes'] ?? [];
+            
+            // If multiple boxes provided, recalculate gross & volumetric weight across all boxes
+            if (!empty($packingListData['boxes']) && count($packingListData['boxes']) > 1) {
+                $multiGross = 0;
+                $multiVol = 0;
+                foreach ($packingListData['boxes'] as $b) {
+                    $bg = (float) ($b['weight_kg'] ?? ($b['gross_weight'] ?? 0));
+                    $bl = (float) ($b['length_cm'] ?? ($b['length'] ?? 0));
+                    $bw = (float) ($b['width_cm'] ?? ($b['width'] ?? 0));
+                    $bh = (float) ($b['height_cm'] ?? ($b['height'] ?? 0));
+                    $multiGross += $bg;
+                    $multiVol += ($bl * $bw * $bh) / 5000;
+                }
+                if ($multiGross > 0) {
+                    $shipment->actual_weight = round($multiGross, 2);
+                }
+                if ($multiVol > 0) {
+                    $shipment->volumetric_weight = round($multiVol, 2);
+                    $shipment->chargeable_weight = max($shipment->actual_weight, $shipment->volumetric_weight);
+                }
+            }
+        }
+
+        // Operational Intelligence Telemetry (18 Core Tracking Parameters)
+        $shipment->destination_country = $shipment->receiver_country;
+        $shipment->acquisition_source = $request->input('acquisition_source', 'direct_portal');
+        $shipment->price_quoted = (float) $rate;
+        $shipment->price_sold = (float) $shipment->total_amount;
+        
+        // Vendor & Fulfillment Cost
+        $costAmount = $request->filled('cost_amount') 
+            ? (float) $request->cost_amount 
+            : round(((float)$shipment->total_amount) * 0.65, 2);
+        $shipment->cost_amount = $costAmount;
+        $shipment->gross_margin = round($shipment->price_sold - $costAmount, 2);
+        $shipment->gross_margin_percentage = $shipment->price_sold > 0 
+            ? round(($shipment->gross_margin / $shipment->price_sold) * 100, 2) 
+            : 0;
+
+        // Vendor / Carrier Assignment
+        $shipment->vendor_name = $request->input('vendor_name') 
+            ?: ($shipment->shipment_type === 'international' ? 'International Air Cargo Network' : 'Netpack Ground Fleet');
+        $shipment->vendor_id = $request->input('vendor_id');
+
+        // Customer Retention & Repeat Sequence Tracking
+        $priorCount = Shipment::where('customer_id', $shipment->customer_id)->count();
+        $shipment->is_repeat_customer = ($priorCount > 0);
+        $shipment->customer_shipment_sequence = $priorCount + 1;
+
+        // Performance & Incident Defaults
+        $shipment->is_delayed = false;
+        $shipment->delay_hours = 0;
+        $shipment->is_returned = false;
+        $shipment->is_damaged = false;
+        $shipment->has_complaint = false;
+        $shipment->complaint_count = 0;
+
+        $shipment->save();
+
+        // Automatically initialize booking milestone in tracking history
+        app(\App\Services\AutomatedTrackingService::class)->recordBookingPlaced(
+            $shipment,
+            $shipment->sender_city ?: 'Kathmandu Gateway',
+            Auth::user()
+        );
+
+        // Link or create doorstep pickup request if requested
+        $createdPickup = null;
+        if ($request->filled('convert_pickup_id') && $user) {
+            $existingPickup = PickupRequest::where('seller_id', $user->id)->find($request->convert_pickup_id);
+            if ($existingPickup) {
+                $existingPickup->shipment_id = $shipment->id;
+                $existingPickup->status_notes = ($existingPickup->status_notes ? $existingPickup->status_notes . ' | ' : '') . 'Upgraded to Consignment ' . ($shipment->hawb_number ?: $shipment->tracking_number);
+                $existingPickup->save();
+            }
+        } elseif ($request->boolean('schedule_doorstep_pickup') && $user) {
+            $pickupTime = $request->filled('scheduled_pickup_time')
+                ? \Carbon\Carbon::parse($request->scheduled_pickup_time)
+                : now()->addHours(2);
+
+            $primaryPickup = $pickupPoints[0] ?? [
+                'name' => $firstPickup,
+                'phone' => $firstPickupPhone,
+                'address' => $firstPickupAddress,
+            ];
+
+            $createdPickup = PickupRequest::create([
+                'seller_id' => $user->id,
+                'shipment_id' => $shipment->id,
+                'contact_person_name' => $primaryPickup['name'] ?? $user->name,
+                'contact_person_phone' => $primaryPickup['phone'] ?? ($user->phone ?? '9800000000'),
+                'pickup_address' => $primaryPickup['address'] ?? ($user->address ?? 'Kathmandu'),
+                'pickup_city' => $shipment->sender_city ?? 'Kathmandu Valley',
+                'pickup_latitude' => $primaryPickup['lat'] ?? null,
+                'pickup_longitude' => $primaryPickup['lng'] ?? null,
+                'delivery_address' => $shipment->receiver_address,
+                'delivery_city' => $shipment->receiver_city ?? 'Destination',
+                'customer_name' => $shipment->receiver_name,
+                'customer_phone' => $shipment->receiver_phone,
+                'items_description' => 'Doorstep Collection for Consignment ' . ($shipment->hawb_number ?: $shipment->tracking_number) . ' (' . $shipment->package_type . ')',
+                'estimated_weight_kg' => $shipment->chargeable_weight ?: $shipment->actual_weight,
+                'service_tier' => $shipment->service_type ?: 'standard',
+                'scheduled_pickup_time' => $pickupTime,
+                'status' => 'pending',
+                'status_notes' => 'Doorstep collection scheduled with Consignment ' . ($shipment->hawb_number ?: $shipment->tracking_number),
+            ]);
+        }
+
+        if ($domesticPlan) {
+            $this->persistDomesticPlan($shipment, $domesticPlan, $request);
+        }
+
+        DB::commit();
+
+        $pickupNote = $createdPickup ? " & Doorstep Pickup Scheduled (Ref: {$createdPickup->tracking_number})" : "";
+        return redirect()->route('tracking.show', $shipment->tracking_number)
+            ->with('success', 'Shipment booked successfully! Tracking: ' . $shipment->tracking_number . ' | HAWB: ' . $shipment->hawb_number . $pickupNote)
+            ->with('booking_confirmed', true)
+            ->with('new_shipment_id', $shipment->id)
+            ->with('new_hawb_number', $shipment->hawb_number)
+            ->with('new_tracking_number', $shipment->tracking_number)
+            ->with('new_shipment_type', $shipment->shipment_type)
+            ->with('is_cod', $shipment->is_cod)
+            ->with('cod_amount', $shipment->cod_amount);
+        } catch (\Throwable $exception) {
+            DB::rollBack();
+            report($exception);
+
+            return back()->withInput()->withErrors([
+                'shipment' => 'The shipment could not be booked safely. No charge was recorded. Please try again or contact operations.',
+            ]);
+        }
+    }
+
+    /**
+     * Display the specified shipment.
+     */
+    public function show(Shipment $shipment)
+    {
+        return view('tracking.public', compact('shipment'));
+    }
+
+    /**
+     * Show the form for editing the specified shipment.
+     */
+    public function edit($id)
+    {
+        $shipment = Shipment::findOrFail($id);
+        
+        // Check authorization
+        $user = Auth::user();
+        if ($shipment->customer_id !== $user->id && !$user->isSuperAdmin() && !$user->isDomesticAdmin()) {
+            abort(403, 'Unauthorized action.');
+        }
+        
+        return view('shipments.edit', compact('shipment'));
+    }
+
+    /**
+     * Update the specified shipment.
+     */
+    public function update(Request $request, $id)
+    {
+        $shipment = Shipment::findOrFail($id);
+        
+        // Check authorization
+        $user = Auth::user();
+        if ($shipment->customer_id !== $user->id && !$user->isSuperAdmin() && !$user->isDomesticAdmin()) {
+            abort(403, 'Unauthorized action.');
+        }
+        
+        $validator = Validator::make($request->all(), [
+            'receiver_name' => 'required|string|max:255',
+            'receiver_phone' => 'required|string|max:20',
+            'receiver_address' => 'required|string',
+            'weight' => 'required|numeric|min:0.1',
+            'description' => 'nullable|string',
+        ]);
+
+        if ($validator->fails()) {
+            return redirect()->back()
+                ->withErrors($validator)
+                ->withInput();
+        }
+
+        // Only allow updates if status is pending
+        if ($shipment->status !== 'pending' && $shipment->status !== 'confirmed') {
+            return redirect()->back()
+                ->with('error', 'Shipment cannot be edited. Current status: ' . ucfirst($shipment->status));
+        }
+
+        $shipment->update([
+            'receiver_name' => $request->receiver_name,
+            'receiver_phone' => $request->receiver_phone,
+            'receiver_address' => $request->receiver_address,
+            'receiver_city' => $request->receiver_city ?? $shipment->receiver_city,
+            'receiver_country' => $request->receiver_country ?? $shipment->receiver_country,
+            'actual_weight' => $request->weight,
+            'chargeable_weight' => $request->weight,
+            'description' => $request->description,
+        ]);
+
+        return redirect()->route('tracking.show', $shipment->tracking_number)
+            ->with('success', 'Shipment updated successfully!');
+    }
+
+    /**
+     * Remove the specified shipment.
+     */
+    public function destroy($id)
+    {
+        $shipment = Shipment::findOrFail($id);
+        
+        // Check authorization
+        $user = Auth::user();
+        if ($shipment->customer_id !== $user->id && !$user->isSuperAdmin() && !$user->isDomesticAdmin()) {
+            abort(403, 'Unauthorized action.');
+        }
+        
+        // Only allow deletion if status is pending
+        if ($shipment->status !== 'pending') {
+            return redirect()->back()
+                ->with('error', 'Cannot delete shipment. Shipment is already in progress.');
+        }
+        
+        $shipment->delete();
+        
+        return redirect()->route('shipments.index')
+            ->with('success', 'Shipment deleted successfully!');
+    }
+
+    /**
+     * Update shipment status.
+     */
+    public function updateStatus(Request $request, $id)
+    {
+        $request->validate([
+            'status' => 'required|in:pending,confirmed,processing,picked_up,in_transit,customs_clearance,out_for_delivery,delivered,returned,cancelled,failed',
+            'note' => 'nullable|string',
+            'location' => 'nullable|string',
+        ]);
+
+        $shipment = Shipment::findOrFail($id);
+        $oldStatus = $shipment->status;
+        $newStatus = $request->status;
+        
+        $shipment->status = $newStatus;
+        
+        // Add to tracking timeline
+        $timeline = $shipment->tracking_timeline ?? [];
+        $timeline[] = [
+            'status' => $newStatus,
+            'note' => $request->note ?? "Status updated from {$oldStatus} to {$newStatus}",
+            'location' => $request->location ?? 'System',
+            'timestamp' => now()->toDateTimeString(),
+            'updated_by' => Auth::user()->name,
+        ];
+        $shipment->tracking_timeline = $timeline;
+
+        if ($newStatus === 'delivered') {
+            $shipment->recordDeliveryTelemetry();
+        } elseif ($newStatus === 'returned') {
+            $shipment->is_returned = true;
+            $shipment->returned_at = now();
+            if ($request->filled('note')) {
+                $shipment->return_reason = $request->note;
+            }
+        }
+
+        $shipment->save();
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Shipment status updated successfully',
+            'shipment' => $shipment
+        ]);
+    }
+
+    /**
+     * Get tracking information via API.
+     */
+    public function getTracking($trackingNumber)
+    {
+        $shipment = Shipment::where('tracking_number', $trackingNumber)
+            ->with(['customer', 'seller', 'rider'])
+            ->firstOrFail();
+        
+        return response()->json([
+            'success' => true,
+            'shipment' => $shipment
+        ]);
+    }
+
+    /**
+     * Generate tracking number.
+     */
+    private function generateTrackingNumber(?string $serviceType = null, ?string $shipmentType = null)
+    {
+        return Shipment::generateTrackingNumber($serviceType, $shipmentType);
+    }
+
+    /**
+     * Generate HAWB number based on service mode.
+     */
+    private function generateHAWBNumber(string $shipmentType, ?string $destination = null): string
+    {
+        $trackingService = app(\App\Services\TrackingNumberService::class);
+        if ($shipmentType === 'international') {
+            return $trackingService->internationalHawb($destination);
+        } elseif ($shipmentType === 'ecommerce') {
+            return $trackingService->ecommerceHawb();
+        } else {
+            return $trackingService->domesticHawb($destination);
+        }
+    }
+
+    /**
+     * Calculate shipping rate.
+     */
+    private function calculateRate($request)
+    {
+        $weight = (float) ($request->weight ?? 1.0);
+        $type = $request->shipment_type;
+        $service = $request->service_type ?? 'standard';
+
+        if ($type === 'domestic') {
+            // Domestic base calculation fallback if partner matrix rate quote is empty
+            $base = match($service) {
+                'flash' => 160,
+                'same_day' => 140,
+                'himalayan' => 250,
+                default => 120,
+            };
+            return $base + (max(0, $weight - 1) * 35);
+        } elseif ($type === 'international') {
+            try {
+                $quote = app(\App\Services\InternationalRateService::class)->quote(
+                    $request->receiver_country ?? 'United States',
+                    (float) $weight,
+                    $request->length ? (float)$request->length : null,
+                    $request->width ? (float)$request->width : null,
+                    $request->height ? (float)$request->height : null,
+                    'none',
+                    $service
+                );
+                if (!empty($quote['quotes'][0]['itemized']['total_cost'])) {
+                    return (float) $quote['quotes'][0]['itemized']['total_cost'];
+                }
+            } catch (\Throwable $e) {
+                // Fallback to basic formula if matrix lookup fails
+            }
+
+            switch($service) {
+                case 'express':
+                    return 800 + ($weight * 150);
+                case 'economy':
+                default:
+                    return 500 + ($weight * 80);
+            }
+        } else {
+            // E-commerce direct rider rate calculation
+            $base = match($service) {
+                'flash' => 140,
+                'same_day' => 100,
+                default => 80,
+            };
+            return $base + (max(0, $weight - 1) * 20);
+        }
+    }
+
+    private function persistDomesticPlan(Shipment $shipment, array $plan, Request $request): void
+    {
+        $createdLegs = collect($plan['legs'])->values()->map(function (array $legData, int $index) use ($shipment, $plan, $request) {
+            $rate = $legData['rate'];
+
+            return $shipment->legs()->create([
+                'sequence' => $index + 1,
+                'leg_type' => $rate->rate_type,
+                'partner_id' => $rate->partner_id,
+                'domestic_rate_id' => $rate->id,
+                'origin_zone_id' => $rate->origin_zone_id,
+                'destination_zone_id' => $rate->destination_zone_id,
+                'origin_name' => $rate->originZone?->zone_name ?? $rate->origin_city,
+                'destination_name' => $rate->destinationZone?->zone_name ?? $rate->destination_city,
+                'status' => 'assigned',
+                'assignment_source' => $legData['assignment_source'],
+                'selected_by' => $request->user()->id,
+                'partner_cost' => $legData['partner_cost'],
+                'markup_amount' => $legData['markup_amount'],
+                'customer_price' => $legData['customer_price'],
+                'currency' => $plan['currency'],
+                'metadata' => ['quote_expires_at' => $plan['expires_at'], 'breakdown' => $legData['breakdown']],
+            ]);
+        });
+
+        $firstLeg = $createdLegs->first();
+        $isExplicitSelfDropoff = $request->has('schedule_doorstep_pickup') && ($request->schedule_doorstep_pickup === '0' || $request->schedule_doorstep_pickup === 0 || $request->schedule_doorstep_pickup === false);
+
+        if ($firstLeg && !$isExplicitSelfDropoff) {
+            $origin = $plan['origin_zone'];
+            $destination = $plan['destination_zone'];
+
+            $existingPickup = PickupRequest::where('shipment_id', $shipment->id)->first();
+            if ($existingPickup) {
+                $existingPickup->update([
+                    'partner_user_id' => $firstLeg->partner_id,
+                    'pickup_municipality' => $origin->zone_name,
+                    'pickup_district' => $origin->district ?: ($origin->districts[0] ?? $origin->zone_name),
+                    'pickup_province' => $origin->province ?: 'Not specified',
+                    'delivery_municipality' => $destination->zone_name,
+                    'delivery_district' => $destination->district ?: ($destination->districts[0] ?? $destination->zone_name),
+                    'delivery_province' => $destination->province ?: 'Not specified',
+                    'status' => 'assigned',
+                    'calculated_price' => $plan['customer_price'],
+                ]);
+            } else {
+                PickupRequest::create([
+                    'seller_id' => $shipment->customer_id,
+                    'shipment_id' => $shipment->id,
+                    'partner_user_id' => $firstLeg->partner_id,
+                    'pickup_address' => $request->pickup_address[0],
+                    'pickup_ward_no' => 'N/A',
+                    'pickup_municipality' => $origin->zone_name,
+                    'pickup_district' => $origin->district ?: ($origin->districts[0] ?? $origin->zone_name),
+                    'pickup_province' => $origin->province ?: 'Not specified',
+                    'delivery_address' => $shipment->receiver_address,
+                    'delivery_ward_no' => 'N/A',
+                    'delivery_municipality' => $destination->zone_name,
+                    'delivery_district' => $destination->district ?: ($destination->districts[0] ?? $destination->zone_name),
+                    'delivery_province' => $destination->province ?: 'Not specified',
+                    'scheduled_pickup_time' => now(),
+                    'items_description' => $shipment->description ?: 'Parcel shipment',
+                    'estimated_weight_kg' => $shipment->chargeable_weight,
+                    'service_tier' => in_array($shipment->service_type, ['flash', 'same_day', 'standard', 'himalayan'], true) ? $shipment->service_type : 'standard',
+                    'status' => 'assigned',
+                    'calculated_price' => $plan['customer_price'],
+                    'tracking_number' => $shipment->tracking_number,
+                ]);
+            }
+        }
+
+        $notifiedPartners = [];
+        foreach ($createdLegs as $leg) {
+            if ($leg->partner && ! in_array($leg->partner_id, $notifiedPartners, true)) {
+                $leg->partner->notify(new DomesticPickupAssignedNotification($shipment, $leg));
+                $notifiedPartners[] = $leg->partner_id;
+            }
+        }
+
+        if ($firstLeg) {
+            app(DomesticOperationsNotificationService::class)
+                ->notify(new DomesticPickupAssignedNotification($shipment, $firstLeg));
+        }
+    }
+}
