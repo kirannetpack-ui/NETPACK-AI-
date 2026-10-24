@@ -15,6 +15,9 @@ if (!fs.existsSync(vendorAutoload)) {
         const phpBin = path.join(pkgDir, 'native', 'php', 'php');
         const phpLibDir = path.join(pkgDir, 'native', 'lib');
         const phpModulesDir = path.join(pkgDir, 'native', 'php', 'modules');
+        const buildPhpIni = path.join(require('os').tmpdir(), 'netpack-build-php.ini');
+        fs.writeFileSync(buildPhpIni, fs.readFileSync(path.join(pkgDir, 'native', 'php', 'php.ini'), 'utf8')
+            .replace(/^extension_dir\s*=.*$/m, `extension_dir="${phpModulesDir}"`));
         
         try {
             fs.chmodSync(phpBin, 0o755);
@@ -32,11 +35,13 @@ if (!fs.existsSync(vendorAutoload)) {
 
         const env = {
             ...process.env,
+            PHPRC: buildPhpIni,
+            PATH: `${path.dirname(phpBin)}:${process.env.PATH}`,
             LD_LIBRARY_PATH: `${phpLibDir}:/usr/lib64:/lib64:${process.env.LD_LIBRARY_PATH || ''}`
         };
 
         console.log('[Vercel Build] Running composer install --no-dev --optimize-autoloader...');
-        execSync(`"${phpBin}" -d extension_dir="${phpModulesDir}" "${composerPhar}" install --no-dev --prefer-dist --optimize-autoloader --no-interaction`, {
+        execSync(`"${phpBin}" -c "${buildPhpIni}" "${composerPhar}" install --no-dev --prefer-dist --optimize-autoloader --no-interaction`, {
             cwd: projectRoot,
             env,
             stdio: 'inherit'
