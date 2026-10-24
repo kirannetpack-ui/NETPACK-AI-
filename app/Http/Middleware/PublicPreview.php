@@ -17,6 +17,11 @@ class PublicPreview
             return response()->view('welcome')->header('Cache-Control', 'no-store');
         }
 
+        if ($request->isMethod('GET') && $request->path() === 'login') {
+            return response()->view('auth.login', ['errors' => new \Illuminate\Support\ViewErrorBag])
+                ->header('Cache-Control', 'no-store');
+        }
+
         if ($request->expectsJson()) {
             return response()->json(['message' => 'Booking and account services are not open yet.'], 503);
         }

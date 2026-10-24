@@ -16,31 +16,43 @@
         <footer>COURIER WITH NETPACK / NEPAL</footer>
     </aside>
     <main class="np-auth-main" id="sign-in">
+        @php($previewOnly = config('deployment.mode') === 'public-preview')
         <p class="np-eyebrow">Welcome to your workspace</p>
         <h2>Sign in to NETPACK</h2>
         <p class="np-auth-description">Access your account and pick up where you left off.</p>
+        @if($previewOnly)
+        <div class="np-alert" role="status"><strong>Online demo setup is pending.</strong><br>The login page is available, but sign-in requires a connected database and seeded accounts. The test credentials below are currently available on localhost only.</div>
+        @endif
         @if(session('error'))<div class="np-alert" role="alert">{{ session('error') }}</div>@endif
         @if($errors->any())<div class="np-alert" role="alert"><ul>@foreach($errors->all() as $error)<li>{{ $error }}</li>@endforeach</ul></div>@endif
         @if(session('success'))<div class="np-alert" role="status">{{ session('success') }}</div>@endif
         <form method="POST" action="{{ route('login.submit') }}" id="loginForm" class="np-auth-form" x-data="{ showPassword: false }">
             @csrf
-            <div><label for="email">Email address</label><input id="email" type="email" name="email" value="{{ old('email') }}" placeholder="you@company.com" required autocomplete="username" autofocus></div>
-            <div><div class="np-auth-password-label"><label for="password">Password</label><button type="button" @click="showPassword = !showPassword" :aria-pressed="showPassword" x-text="showPassword ? 'Hide password' : 'Show password'">Show password</button></div><input id="password" :type="showPassword ? 'text' : 'password'" type="password" name="password" required autocomplete="current-password" placeholder="Enter your password"></div>
-            <div class="np-auth-meta"><label><input type="checkbox" name="remember" {{ old('remember') ? 'checked' : '' }}> Keep me signed in</label><a href="{{ route('tracking.page') }}">Track without signing in ↗</a></div>
-            <button type="submit" class="np-button" id="loginBtn">Sign in <span aria-hidden="true">→</span></button>
+            <div><label for="email">Email address</label><input id="email" type="email" name="email" value="{{ old('email') }}" placeholder="you@company.com" required autocomplete="username" autofocus @disabled($previewOnly)></div>
+            <div><div class="np-auth-password-label"><label for="password">Password</label><button type="button" @click="showPassword = !showPassword" :aria-pressed="showPassword" x-text="showPassword ? 'Hide password' : 'Show password'">Show password</button></div><input id="password" :type="showPassword ? 'text' : 'password'" type="password" name="password" required autocomplete="current-password" placeholder="Enter your password" @disabled($previewOnly)></div>
+            <div class="np-auth-meta"><label><input type="checkbox" name="remember" @disabled($previewOnly) {{ old('remember') ? 'checked' : '' }}> Keep me signed in</label><a href="{{ route('tracking.page') }}">Track without signing in ↗</a></div>
+            <button type="submit" class="np-button" id="loginBtn" @disabled($previewOnly) style="{{ $previewOnly ? 'opacity:.5;cursor:not-allowed' : '' }}">{{ $previewOnly ? 'Sign-in awaiting database setup' : 'Sign in' }} <span aria-hidden="true">→</span></button>
         </form>
         <div class="np-auth-footer">New to NETPACK? <a href="{{ route('register') }}">Create an account ↗</a></div>
-        @if(app()->environment(['local', 'testing']))
-        <details class="np-auth-demo"><summary>Development preview · demo accounts</summary><div>
+        @if(app()->environment(['local', 'testing']) || $previewOnly)
+        <details class="np-auth-demo" @if($previewOnly) open @endif><summary>Development preview · demo accounts</summary><div>
             @foreach([
                 ['superadmin@netpack.test', 'Netpack!Admin#2026', 'Super Admin'],
                 ['international.admin@netpack.test', 'Netpack!International#2026', 'Global Admin'],
                 ['domestic.admin@netpack.test', 'Netpack!Domestic#2026', 'Domestic Admin'],
                 ['seller@netpack.test', 'Netpack!Seller#2026', 'Seller Merchant'],
                 ['rider@netpack.test', 'Netpack!Rider#2026', 'Delivery Rider'],
-                ['customer@netpack.test', 'Netpack!Customer#2026', 'Client'],
+                ['customer@netpack.test', 'Netpack!Customer#2026', 'Customer'],
+                ['staff@netpack.test', 'Netpack!Staff#2026', 'Operations Staff'],
+                ['partner@netpack.test', 'Netpack!Partner#2026', 'Domestic Partner'],
+                ['overseas@netpack.test', 'Netpack!Overseas#2026', 'Overseas Partner'],
+                ['client@netpack.test', 'Netpack!Client#2026', 'Business Client'],
             ] as $demo)
+            @if($previewOnly)
+            <section style="grid-column:1/-1;border-bottom:1px solid #e1e6e9;padding:10px 0"><strong>{{ $demo[2] }}</strong><br><span style="overflow-wrap:anywhere">{{ $demo[0] }}</span><br><code>{{ $demo[1] }}</code></section>
+            @else
             <button type="button" onclick="fillRole(@js($demo[0]), @js($demo[1]))">{{ $demo[2] }}</button>
+            @endif
             @endforeach
         </div></details>
         @endif

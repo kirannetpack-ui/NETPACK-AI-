@@ -10,7 +10,10 @@ class PublicPreviewTest extends TestCase
     {
         config(['deployment.mode' => 'public-preview']);
         $this->get('/')->assertOk()->assertSee('Website preview')->assertDontSee('Open AI Logistics Copilot');
-        $this->get('/login')->assertStatus(503)->assertSee('Our workspace is getting ready.');
+        $this->get('/login')->assertOk()->assertSee('Online demo setup is pending.')
+            ->assertSee('superadmin@netpack.test')->assertSee('partner@netpack.test')
+            ->assertSee('Sign-in awaiting database setup');
+        $this->post('/login', ['email' => 'superadmin@netpack.test', 'password' => 'Netpack!Admin#2026'])->assertStatus(503);
         $this->postJson('/api/payments/create', [])->assertStatus(503);
     }
 }
