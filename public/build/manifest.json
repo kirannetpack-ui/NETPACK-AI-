@@ -1,6 +1,6 @@
 {
   "node_modules/@capacitor/app/dist/esm/web.js": {
-    "file": "assets/web-Cj6Guu2t.js",
+    "file": "assets/web-DuOkZ0Eq.js",
     "name": "web",
     "src": "node_modules/@capacitor/app/dist/esm/web.js",
     "isDynamicEntry": true,
@@ -9,7 +9,7 @@
     ]
   },
   "node_modules/@capacitor/browser/dist/esm/web.js": {
-    "file": "assets/web-DGHhgjXa.js",
+    "file": "assets/web-BTtk_sNp.js",
     "name": "web",
     "src": "node_modules/@capacitor/browser/dist/esm/web.js",
     "isDynamicEntry": true,
@@ -18,7 +18,7 @@
     ]
   },
   "node_modules/@capacitor/filesystem/dist/esm/web.js": {
-    "file": "assets/web-DbkCAMC9.js",
+    "file": "assets/web-Dph-oTMi.js",
     "name": "web",
     "src": "node_modules/@capacitor/filesystem/dist/esm/web.js",
     "isDynamicEntry": true,
@@ -27,7 +27,7 @@
     ]
   },
   "node_modules/@capacitor/network/dist/esm/web.js": {
-    "file": "assets/web-hTpSC_8S.js",
+    "file": "assets/web-D7Ytzhxo.js",
     "name": "web",
     "src": "node_modules/@capacitor/network/dist/esm/web.js",
     "isDynamicEntry": true,
@@ -36,7 +36,7 @@
     ]
   },
   "node_modules/@capacitor/share/dist/esm/web.js": {
-    "file": "assets/web-clCufe1u.js",
+    "file": "assets/web-CcCT_URd.js",
     "name": "web",
     "src": "node_modules/@capacitor/share/dist/esm/web.js",
     "isDynamicEntry": true,
@@ -45,7 +45,7 @@
     ]
   },
   "node_modules/@capacitor/splash-screen/dist/esm/web.js": {
-    "file": "assets/web-BLcoL_yk.js",
+    "file": "assets/web-C08uO33e.js",
     "name": "web",
     "src": "node_modules/@capacitor/splash-screen/dist/esm/web.js",
     "isDynamicEntry": true,
@@ -71,7 +71,7 @@
     "isEntry": true
   },
   "resources/js/app.js": {
-    "file": "assets/app-608zHZZq.js",
+    "file": "assets/app-DTKUZC9_.js",
     "name": "app",
     "src": "resources/js/app.js",
     "isEntry": true,
