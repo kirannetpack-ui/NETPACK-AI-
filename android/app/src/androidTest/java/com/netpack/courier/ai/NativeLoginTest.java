@@ -3,11 +3,15 @@ package com.netpack.courier.ai;
 import static org.junit.Assert.*;
 
 import android.webkit.WebView;
+import android.graphics.Bitmap;
+import androidx.test.platform.app.InstrumentationRegistry;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.io.File;
+import java.io.FileOutputStream;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
@@ -50,6 +54,14 @@ public class NativeLoginTest {
                 " && !document.documentElement.hasAttribute('data-before-reload')" +
                 " && document.documentElement.classList.contains('np-native')");
             assertEquals("true", evaluate("document.documentElement.classList.contains('np-native')"));
+            File screenshot = new File(InstrumentationRegistry.getInstrumentation()
+                .getTargetContext().getExternalFilesDir(null), "native-login.png");
+            try (FileOutputStream output = new FileOutputStream(screenshot)) {
+                Bitmap image = InstrumentationRegistry.getInstrumentation().getUiAutomation().takeScreenshot();
+                assertNotNull("Native screenshot unavailable", image);
+                image.compress(Bitmap.CompressFormat.PNG, 100, output);
+                image.recycle();
+            }
         }
     }
 }

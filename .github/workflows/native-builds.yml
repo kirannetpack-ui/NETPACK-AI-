@@ -2,6 +2,12 @@ name: Native Android and iOS builds
 
 on:
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Platform to build
+        type: choice
+        options: [both, android, ios]
+        default: both
   push:
     branches: [main]
     paths:
@@ -10,7 +16,6 @@ on:
       - 'native-shell/**'
       - 'capacitor.config.json'
       - 'package*.json'
-      - '.github/workflows/native-builds.yml'
 
 permissions:
   contents: read
@@ -21,6 +26,7 @@ concurrency:
 
 jobs:
   android:
+    if: github.event_name != 'workflow_dispatch' || inputs.platform != 'ios'
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -41,6 +47,8 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew --no-daemon assembleDebug bundleRelease lintDebug
+      - name: Enable emulator hardware acceleration
+        run: sudo chmod a+rw /dev/kvm
       - name: Validate native login in Android emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -49,7 +57,8 @@ jobs:
           target: google_apis
           profile: pixel_6
           disable-animations: true
-          script: cd android && ./gradlew --no-daemon connectedDebugAndroidTest
+          disable-linux-hw-accel: false
+          script: cd android && ./gradlew --no-daemon connectedDebugAndroidTest && adb pull /sdcard/Android/data/com.netpack.courier.ai/files/native-login.png app/build/reports/native-login.png
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -62,6 +71,7 @@ jobs:
           retention-days: 30
 
   ios:
+    if: github.event_name != 'workflow_dispatch' || inputs.platform != 'android'
     runs-on: macos-15
     timeout-minutes: 35
     steps:
