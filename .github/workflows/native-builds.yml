@@ -21,7 +21,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: native-builds-${{ github.ref }}
+  group: native-builds-${{ github.ref }}-${{ inputs.platform || 'both' }}
   cancel-in-progress: true
 
 jobs:
@@ -107,6 +107,13 @@ jobs:
         run: |
           xcodebuild -project ios/App/App.xcodeproj -scheme App -configuration Release -destination 'generic/platform=iOS' -archivePath artifacts/netpack-ios-unsigned.xcarchive CODE_SIGNING_ALLOWED=NO archive > artifacts/ios-device-build.log 2>&1 || { tail -100 artifacts/ios-device-build.log; exit 1; }
           ditto -c -k --sequesterRsrc --keepParent artifacts/netpack-ios-unsigned.xcarchive artifacts/netpack-ios-unsigned-archive.zip
+      - name: Validate iPhone login and relaunch
+        run: |
+          ruby -e 'require "xcodeproj"' || gem install --user-install xcodeproj --no-document
+          ruby scripts/configure-ios-ui-tests.rb
+          DEVICE=$(xcrun simctl list devices booted -j | jq -r '.devices | to_entries[] | .value[] | select(.state == "Booted") | .udid' | head -1)
+          xcodebuild -project ios/App/App.xcodeproj -scheme NativeUITests -destination "platform=iOS Simulator,id=$DEVICE" -derivedDataPath artifacts/ios-ui-tests -resultBundlePath artifacts/ios-login-results.xcresult CODE_SIGNING_ALLOWED=NO test > artifacts/ios-login-test.log 2>&1 || { tail -100 artifacts/ios-login-test.log; exit 1; }
+          xcrun simctl io "$DEVICE" screenshot artifacts/ios-login.png
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -115,4 +122,5 @@ jobs:
             artifacts/*.zip
             artifacts/*.log
             artifacts/*.png
+            artifacts/*.xcresult
           retention-days: 30
