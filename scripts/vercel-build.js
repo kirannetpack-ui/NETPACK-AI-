@@ -54,11 +54,76 @@ if (!fs.existsSync(vendorAutoload)) {
     console.log('[Vercel Build] vendor/autoload.php found. Skipping composer install.');
 }
 
-// 2. Build Vite assets
+// 2. Run production migrations only when explicitly requested for a controlled deployment.
+// This is intentionally opt-in so ordinary deployments never modify production data.
+if (process.env.NETPACK_RUN_MIGRATIONS === 'true') {
+    console.log('[Vercel Build] Running requested production database migrations...');
+
+    try {
+        const pkgDir = path.dirname(require.resolve('@libphp/almalinux-9-v85/package.json'));
+        const phpBin = path.join(pkgDir, 'native', 'php', 'php');
+        const phpLibDir = path.join(pkgDir, 'native', 'lib');
+        const phpModulesDir = path.join(pkgDir, 'native', 'php', 'modules');
+        const migrationPhpIni = path.join(require('os').tmpdir(), 'netpack-migration-php.ini');
+        const sourcePhpIni = path.join(pkgDir, 'native', 'php', 'php.ini');
+
+        fs.writeFileSync(migrationPhpIni, fs.readFileSync(sourcePhpIni, 'utf8')
+            .replace(/^extension_dir\s*=.*$/m, `extension_dir="${phpModulesDir}"`));
+
+        // Neon poolers are ideal for web requests, while migrations must use
+        // the direct endpoint so DDL runs in a dedicated database session.
+        const migrationHost = process.env.PGHOST_UNPOOLED || process.env.PGHOST;
+        const neonEndpoint = migrationHost?.endsWith('.neon.tech')
+            ? migrationHost.split('.')[0]
+            : undefined;
+
+        execSync(`"${phpBin}" -c "${migrationPhpIni}" artisan migrate --force --no-interaction -vvv`, {
+            cwd: projectRoot,
+            env: {
+                ...process.env,
+                APP_ENV: 'production',
+                DATABASE_URL: process.env.DATABASE_URL_UNPOOLED || process.env.DATABASE_URL,
+                PGHOST: migrationHost,
+                PHPRC: migrationPhpIni,
+                PATH: `${path.dirname(phpBin)}:${process.env.PATH}`,
+                LD_LIBRARY_PATH: `${phpLibDir}:/usr/lib64:/lib64:${process.env.LD_LIBRARY_PATH || ''}`,
+                ...(neonEndpoint ? { PGOPTIONS: process.env.PGOPTIONS || `endpoint=${neonEndpoint}` } : {})
+            },
+            stdio: 'inherit'
+        });
+
+        console.log('[Vercel Build] Production database migrations completed.');
+
+        if (process.env.NETPACK_DEMO_SEED === 'true') {
+            console.log('[Vercel Build] Seeding explicitly enabled demo accounts...');
+            execSync(`"${phpBin}" -c "${migrationPhpIni}" artisan db:seed --force --class='Database\\Seeders\\UserSeeder' --no-interaction`, {
+                cwd: projectRoot,
+                env: {
+                    ...process.env,
+                    APP_ENV: 'production',
+                    APP_DEPLOYMENT_MODE: 'demo',
+                    NETPACK_DEMO_SEED: 'true',
+                    DATABASE_URL: process.env.DATABASE_URL_UNPOOLED || process.env.DATABASE_URL,
+                    PGHOST: migrationHost,
+                    PHPRC: migrationPhpIni,
+                    PATH: `${path.dirname(phpBin)}:${process.env.PATH}`,
+                    LD_LIBRARY_PATH: `${phpLibDir}:/usr/lib64:/lib64:${process.env.LD_LIBRARY_PATH || ''}`,
+                    ...(neonEndpoint ? { PGOPTIONS: process.env.PGOPTIONS || `endpoint=${neonEndpoint}` } : {})
+                },
+                stdio: 'inherit'
+            });
+            console.log('[Vercel Build] Demo accounts seeded.');
+        }
+    } catch (err) {
+        throw new Error('[Vercel Build] Production migration failed: ' + err.message);
+    }
+}
+
+// 3. Build Vite assets
 console.log('[Vercel Build] Building Vite assets...');
 execSync('npx vite build', { cwd: projectRoot, stdio: 'inherit' });
 
-// 3. Ensure both public and dist exist for Vercel Output Directory detection
+// 4. Ensure both public and dist exist for Vercel Output Directory detection
 const publicDir = path.join(projectRoot, 'public');
 const distDir = path.join(projectRoot, 'dist');
 if (!fs.existsSync(distDir)) {

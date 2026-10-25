@@ -17,11 +17,15 @@
     </aside>
     <main class="np-auth-main" id="sign-in">
         @php($previewOnly = config('deployment.mode') === 'public-preview')
+        @php($demoMode = config('deployment.mode') === 'demo')
         <p class="np-eyebrow">Welcome to your workspace</p>
         <h2>Sign in to NETPACK</h2>
         <p class="np-auth-description">Access your account and pick up where you left off.</p>
         @if($previewOnly)
         <div class="np-alert" role="status"><strong>Online demo setup is pending.</strong><br>The login page is available, but sign-in requires a connected database and seeded accounts. The test credentials below are currently available on localhost only.</div>
+        @endif
+        @if($demoMode)
+        <div class="np-alert" role="status"><strong>Demonstration environment.</strong><br>Use the temporary test accounts below to review the workflow. Do not use this environment for live customer or financial operations.</div>
         @endif
         @if(session('error'))<div class="np-alert" role="alert">{{ session('error') }}</div>@endif
         @if($errors->any())<div class="np-alert" role="alert"><ul>@foreach($errors->all() as $error)<li>{{ $error }}</li>@endforeach</ul></div>@endif
@@ -34,8 +38,8 @@
             <button type="submit" class="np-button" id="loginBtn" @disabled($previewOnly) style="{{ $previewOnly ? 'opacity:.5;cursor:not-allowed' : '' }}">{{ $previewOnly ? 'Sign-in awaiting database setup' : 'Sign in' }} <span aria-hidden="true">→</span></button>
         </form>
         <div class="np-auth-footer">New to NETPACK? <a href="{{ route('register') }}">Create an account ↗</a></div>
-        @if(app()->environment(['local', 'testing']) || $previewOnly)
-        <details class="np-auth-demo" @if($previewOnly) open @endif><summary>Development preview · demo accounts</summary><div>
+        @if(app()->environment(['local', 'testing']) || $previewOnly || $demoMode)
+        <details class="np-auth-demo" @if($previewOnly || $demoMode) open @endif><summary>Development preview · demo accounts</summary><div>
             @foreach([
                 ['superadmin@netpack.test', 'Netpack!Admin#2026', 'Super Admin'],
                 ['international.admin@netpack.test', 'Netpack!International#2026', 'Global Admin'],
@@ -48,7 +52,7 @@
                 ['overseas@netpack.test', 'Netpack!Overseas#2026', 'Overseas Partner'],
                 ['client@netpack.test', 'Netpack!Client#2026', 'Business Client'],
             ] as $demo)
-            @if($previewOnly)
+            @if($previewOnly || $demoMode)
             <section style="grid-column:1/-1;border-bottom:1px solid #e1e6e9;padding:10px 0"><strong>{{ $demo[2] }}</strong><br><span style="overflow-wrap:anywhere">{{ $demo[0] }}</span><br><code>{{ $demo[1] }}</code></section>
             @else
             <button type="button" onclick="fillRole(@js($demo[0]), @js($demo[1]))">{{ $demo[2] }}</button>

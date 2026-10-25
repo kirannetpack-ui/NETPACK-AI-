@@ -13,8 +13,13 @@ class UserSeeder extends Seeder
 {
     public function run(): void
     {
-        if (! app()->environment(['local', 'testing'])) {
-            throw new RuntimeException('Demo accounts may only be seeded in local or testing environments.');
+        // Read process variables directly: this seeder can be invoked during
+        // a deployment build before Laravel's compiled configuration exists.
+        $demoDeployment = getenv('APP_DEPLOYMENT_MODE') === 'demo'
+            && getenv('NETPACK_DEMO_SEED') === 'true';
+
+        if (! app()->environment(['local', 'testing']) && ! $demoDeployment) {
+            throw new RuntimeException('Demo accounts may only be seeded in local, testing, or explicitly enabled demo deployments.');
         }
 
         $accounts = [
@@ -87,6 +92,6 @@ class UserSeeder extends Seeder
             }
         }
 
-        $this->command?->info('Local demo accounts seeded. Temporary credentials are documented in README.md.');
+        $this->command?->info('Demo accounts seeded. Temporary credentials are documented in README.md.');
     }
 }

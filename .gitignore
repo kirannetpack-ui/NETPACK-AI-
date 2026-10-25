@@ -26,5 +26,6 @@ routes/*.backup
 /.codex-build/*
 
 .vercel
+.vercel-env-*
 /database/*.sqlite
 /database/*.sqlite-*

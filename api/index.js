@@ -103,6 +103,13 @@ async function ensurePhpServer() {
             DB_CONNECTION: process.env.DB_CONNECTION || 'mysql'
         };
 
+        // Neon requires an endpoint identifier when the bundled libpq client
+        // cannot negotiate SNI itself. Derive it from the managed host without
+        // copying credentials into source or environment configuration.
+        if (env.PGHOST?.endsWith('.neon.tech') && !env.PGOPTIONS) {
+            env.PGOPTIONS = `endpoint=${env.PGHOST.split('.')[0]}`;
+        }
+
         const args = [
             '-c', fs.existsSync(customPhpIni) ? customPhpIni : phpIni,
             '-d', `extension_dir=${phpModulesDir}`,

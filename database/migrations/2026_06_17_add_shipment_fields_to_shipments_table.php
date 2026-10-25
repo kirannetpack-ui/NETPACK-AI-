@@ -2,6 +2,7 @@
 
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
 return new class extends Migration
@@ -41,13 +42,24 @@ return new class extends Migration
             $table->decimal('discount', 12, 2)->default(0)->after('total_amount');
             $table->json('tracking_timeline')->nullable()->after('tracking_history');
             
-            // New status values for enhanced tracking
-            $table->enum('status', [
-                'pending', 'confirmed', 'processing', 'picked_up',
-                'in_transit', 'customs_clearance', 'out_for_delivery',
-                'delivered', 'returned', 'cancelled', 'failed'
-            ])->default('pending')->change();
         });
+
+        $statuses = [
+            'pending', 'confirmed', 'processing', 'picked_up',
+            'in_transit', 'customs_clearance', 'out_for_delivery',
+            'delivered', 'returned', 'cancelled', 'failed',
+        ];
+
+        if (DB::getDriverName() === 'pgsql') {
+            // PostgreSQL represents Laravel enums as a varchar check constraint.
+            // Rebuild that constraint instead of issuing MySQL-style enum change SQL.
+            DB::statement('ALTER TABLE shipments DROP CONSTRAINT IF EXISTS shipments_status_check');
+            DB::statement("ALTER TABLE shipments ADD CONSTRAINT shipments_status_check CHECK (status IN ('".implode("', '", $statuses)."'))");
+        } else {
+            Schema::table('shipments', function (Blueprint $table) use ($statuses) {
+                $table->enum('status', $statuses)->default('pending')->change();
+            });
+        }
     }
 
     public function down()
