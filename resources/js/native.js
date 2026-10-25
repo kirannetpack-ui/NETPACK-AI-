@@ -22,7 +22,7 @@ if (Capacitor.isNativePlatform()) {
     Network.getStatus().then(connection).catch(console.warn);
     Network.addListener('networkStatusChange', connection).catch(console.warn);
     SplashScreen.hide().catch(console.warn);
-    StatusBar.setStyle({ style: Style.Light }).catch(console.warn);
+    StatusBar.setStyle({ style: Style.Dark }).catch(console.warn);
 
     if (Capacitor.getPlatform() === 'android') {
         App.addListener('backButton', ({ canGoBack }) => {
