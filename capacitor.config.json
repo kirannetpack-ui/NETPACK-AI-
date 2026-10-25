@@ -3,7 +3,7 @@
   "appName": "COURIER with NETPACK",
   "webDir": "native-shell",
   "server": {
-    "url": "https://netpack-ai.vercel.app",
+    "url": "https://netpack-ai.vercel.app/dashboard",
     "cleartext": false,
     "errorPath": "offline.html",
     "allowNavigation": [

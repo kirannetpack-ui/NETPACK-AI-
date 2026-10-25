@@ -4,6 +4,8 @@ import { Browser } from '@capacitor/browser';
 import { Network } from '@capacitor/network';
 import { SplashScreen } from '@capacitor/splash-screen';
 import { StatusBar, Style } from '@capacitor/status-bar';
+import { Filesystem, Directory } from '@capacitor/filesystem';
+import { Share } from '@capacitor/share';
 
 if (Capacitor.isNativePlatform()) {
     document.documentElement.classList.add('np-native');
@@ -29,14 +31,46 @@ if (Capacitor.isNativePlatform()) {
         }).catch(console.warn);
     }
 
+    async function shareDocument(url, suggestedName) {
+        try {
+            const response = await fetch(url, { credentials: 'same-origin' });
+            if (!response.ok || /text\/html/i.test(response.headers.get('Content-Type') || '')) {
+                throw new Error('Document unavailable. Check your account and retry.');
+            }
+            const blob = await response.blob();
+            if (blob.size > 25 * 1024 * 1024) throw new Error('Use the web portal to download files over 25 MB.');
+            const disposition = response.headers.get('Content-Disposition') || '';
+            const name = (disposition.match(/filename="?([^";]+)"?/i)?.[1] || suggestedName || 'document')
+                .replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120);
+            const data = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(String(reader.result).split(',')[1]);
+                reader.onerror = reject;
+                reader.readAsDataURL(blob);
+            });
+            const file = await Filesystem.writeFile({ path: `exports/${Date.now()}-${name}`, data,
+                directory: Directory.Cache, recursive: true });
+            await Share.share({ title: name, files: [file.uri], dialogTitle: 'Save or share document' });
+        } catch (error) {
+            window.alert(error.message || 'Unable to open the document. Please retry.');
+        }
+    }
+
     // External support links belong in the system browser, outside the session.
     document.addEventListener('click', (event) => {
         const link = event.target.closest?.('a[href]');
         if (!link || event.defaultPrevented) return;
         const url = new URL(link.href, window.location.href);
+        if (url.origin === window.location.origin &&
+            (link.hasAttribute('download') || /\/(?:download|export)(?:\/|$)/.test(url.pathname) || /\.pdf$/i.test(url.pathname))) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            shareDocument(url.href, link.download || url.pathname.split('/').pop());
+            return;
+        }
         if (url.protocol === 'https:' && url.origin !== window.location.origin) {
             event.preventDefault();
             Browser.open({ url: url.href }).catch(console.warn);
         }
-    });
+    }, true);
 }

@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 $project = Split-Path $PSScriptRoot -Parent
 foreach ($size in @(48, 72, 96, 144, 180, 192, 512, 1024)) {
-    $bitmap = New-Object System.Drawing.Bitmap($size, $size)
+    $bitmap = [System.Drawing.Bitmap]::new($size, $size, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
     $canvas = [System.Drawing.Graphics]::FromImage($bitmap)
     $canvas.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $canvas.Clear([System.Drawing.ColorTranslator]::FromHtml('#142b3a'))

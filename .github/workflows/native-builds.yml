@@ -33,6 +33,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+          cache: gradle
       - run: npm ci
       - run: npx cap sync android
       - name: Build test APK and unsigned store bundle
