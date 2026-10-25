@@ -103,6 +103,13 @@ async function ensurePhpServer() {
             DB_CONNECTION: process.env.DB_CONNECTION || 'mysql'
         };
 
+        // PHP PDO uses session-level prepared statements. Keep transactions on
+        // one PostgreSQL session rather than routing them through PgBouncer.
+        if (env.DATABASE_URL_UNPOOLED) {
+            env.DATABASE_URL = env.DATABASE_URL_UNPOOLED;
+            env.PGHOST = new URL(env.DATABASE_URL).hostname;
+        }
+
         // Neon requires an endpoint identifier when the bundled libpq client
         // cannot negotiate SNI itself. Derive it from the managed host without
         // copying credentials into source or environment configuration.

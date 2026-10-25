@@ -7,12 +7,14 @@
         if (window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true) {
             canInstall = false;
         } else {
+            canInstall = window.netpackInstallAvailable && !sessionStorage.getItem('pwa_prompt_dismissed');
             window.addEventListener('pwa-installable', () => {
                 if (!sessionStorage.getItem('pwa_prompt_dismissed')) {
                     canInstall = true;
                 }
             });
         }
+        window.addEventListener('pwa-installed', () => { canInstall = false; });
      "
      x-show="canInstall && !dismissed"
      x-transition:enter="transition ease-out duration-300"

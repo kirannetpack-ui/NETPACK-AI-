@@ -1,7 +1,7 @@
 /** Public static caching only. Operational actions require a live connection. */
-const CACHE_NAME = 'netpack-public-v5';
+const CACHE_NAME = 'netpack-public-v6';
 const OFFLINE_URL = '/offline.html';
-const STATIC_ASSETS = ['/offline.html', '/manifest.json', '/images/logo-icon.png', '/images/logo.png', '/images/logo.svg', '/images/logo-white.svg'];
+const STATIC_ASSETS = ['/offline.html', '/images/app-icon-180.png', '/images/app-icon-192.png', '/images/app-icon-512.png', '/images/logo.svg', '/images/logo-white.svg'];
 self.addEventListener('install', event => {
     event.waitUntil((async () => {
         const cache = await caches.open(CACHE_NAME);
@@ -44,8 +44,8 @@ self.addEventListener('push', (event) => {
     let payload = {
         title: 'COURIER with NETPACK Status Alert',
         body: 'Your shipment status has just been updated.',
-        icon: '/images/logo-icon.png',
-        badge: '/images/logo-icon.png',
+        icon: '/images/app-icon-192.png',
+        badge: '/images/app-icon-192.png',
         data: { url: '/client/dashboard' },
         vibrate: [100, 50, 100],
         actions: [
@@ -66,8 +66,8 @@ self.addEventListener('push', (event) => {
     event.waitUntil(
         self.registration.showNotification(payload.title, {
             body: payload.body,
-            icon: payload.icon || '/images/logo-icon.png',
-            badge: payload.badge || '/images/logo-icon.png',
+            icon: payload.icon || '/images/app-icon-192.png',
+            badge: payload.badge || '/images/app-icon-192.png',
             data: payload.data,
             vibrate: payload.vibrate || [100, 50, 100],
             actions: payload.actions || []

@@ -11,7 +11,7 @@ function worker(fetch = async () => { throw new Error('offline'); }) {
         self: {location: {origin: 'https://netpack.test'}, addEventListener: (name, fn) => handlers[name] = fn,
             clients: {claim: async () => {}}, skipWaiting: async () => {}},
         caches: {open: async () => cache, match: async () => new Response('offline page'),
-            keys: async () => ['netpack-ai-v2.2.0', 'unrelated-cache', 'netpack-public-v3', 'netpack-public-v4'],
+            keys: async () => ['netpack-ai-v2.2.0', 'unrelated-cache', 'netpack-public-v3', 'netpack-public-v4', 'netpack-public-v5', 'netpack-public-v6'],
             delete: async key => removed.push(key)},
     };
     vm.runInNewContext(fs.readFileSync('public/service-worker.js', 'utf8'), context);
@@ -20,7 +20,7 @@ function worker(fetch = async () => { throw new Error('offline'); }) {
 
 test('private data, uploads, APIs and mutations never enter the service-worker cache', () => {
     const {handlers} = worker();
-    for (const path of ['/seller/wallet', '/rider-documents/1/selfie_photo_path', '/storage/kyc/private.jpg', '/api/user', '/tracking/123', '/ai/chat']) {
+    for (const path of ['/manifest.json', '/seller/wallet', '/rider-documents/1/selfie_photo_path', '/storage/kyc/private.jpg', '/api/user', '/tracking/123', '/ai/chat']) {
         let intercepted = false;
         handlers.fetch({request: new Request('https://netpack.test'+path), respondWith: () => intercepted = true});
         assert.equal(intercepted, false, path);
@@ -53,7 +53,7 @@ test('activation purges old NETPACK caches without deleting another app cache', 
     let result;
     handlers.activate({waitUntil: p => result = p});
     await result;
-    assert.deepEqual(removed, ['netpack-ai-v2.2.0', 'netpack-public-v3', 'netpack-public-v4']);
+    assert.deepEqual(removed, ['netpack-ai-v2.2.0', 'netpack-public-v3', 'netpack-public-v4', 'netpack-public-v5']);
 });
 
 test('notification URLs cannot navigate to an external origin', async () => {

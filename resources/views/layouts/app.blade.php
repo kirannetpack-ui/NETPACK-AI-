@@ -5,12 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>@yield('title', config('app.name'))</title>
     <!-- PWA & Mobile Meta Tags -->
-    <link rel="manifest" href="/manifest.json">
-    <meta name="theme-color" content="#142b3a">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="default">
-    <meta name="apple-mobile-web-app-title" content="COURIER with NETPACK">
-    <link rel="apple-touch-icon" href="/images/logo-icon.png">
+    <x-pwa-head />
     <meta name="mobile-web-app-capable" content="yes">
 
     @vite(['resources/css/app.css', 'resources/js/app.js'])
@@ -112,33 +107,6 @@
 
     <!-- PWA Install Banner Component -->
     <x-pwa-install-banner />
-
-    <!-- PWA Service Worker Registration & App Install Handler -->
-    <script>
-        if ('serviceWorker' in navigator) {
-            window.addEventListener('load', () => {
-                navigator.serviceWorker.register('/service-worker.js')
-                    .then((reg) => console.log('[PWA] Service Worker registered with scope:', reg.scope))
-                    .catch((err) => console.warn('[PWA] Service Worker registration failed:', err));
-            });
-        }
-
-        // Global PWA Install Prompt Handler
-        let deferredPrompt;
-        window.addEventListener('beforeinstallprompt', (e) => {
-            e.preventDefault();
-            deferredPrompt = e;
-            window.dispatchEvent(new CustomEvent('pwa-installable'));
-        });
-        window.installNetpackApp = async () => {
-            if (deferredPrompt) {
-                deferredPrompt.prompt();
-                const { outcome } = await deferredPrompt.userChoice;
-                console.log(`[PWA] User response to install prompt: ${outcome}`);
-                deferredPrompt = null;
-            }
-        };
-    </script>
 
     @stack('scripts')
 </body>

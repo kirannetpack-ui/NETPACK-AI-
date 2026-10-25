@@ -5,7 +5,6 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\User;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\Rules\Password;
@@ -26,18 +25,16 @@ class AuthController extends Controller
             ], 422);
         }
 
-        if (!Auth::attempt($request->only('email', 'password'))) {
+        // Native clients authenticate with a bearer token, without a browser session.
+        $user = User::where('email', strtolower(trim($request->input('email'))))->first();
+        if (!$user || !Hash::check($request->input('password'), $user->password)) {
             return response()->json([
                 'success' => false,
                 'message' => 'Invalid credentials'
             ], 401);
         }
 
-        $user = Auth::user();
-
         if ($user->verification_status !== 'approved') {
-            Auth::logout();
-
             return response()->json([
                 'success' => false,
                 'message' => 'Your account is not approved for access.',
@@ -45,8 +42,6 @@ class AuthController extends Controller
         }
 
         if (!$user->password_changed) {
-            Auth::logout();
-
             return response()->json([
                 'success' => false,
                 'message' => 'You must change your temporary password before using the API.',

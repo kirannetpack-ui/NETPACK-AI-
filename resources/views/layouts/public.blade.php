@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>@yield('title', 'COURIER with NETPACK — Courier & logistics')</title>
+    <x-pwa-head />
     @vite(['resources/css/app.css', 'resources/js/app.js'])
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     @stack('styles')
@@ -16,5 +17,6 @@
 <footer class="np-public-footer"><div class="np-container"><div><x-wordmark /><p>&copy; {{ now()->year }} COURIER with NETPACK · Nepal</p></div><nav aria-label="Footer navigation"><a href="{{ route('tracking.page') }}">Tracking</a><a href="{{ route('rates.inquiry') }}">Rates</a><a href="{{ route('login') }}">Account</a></nav></div></footer>
 <x-ai-copilot-widget />
 @stack('scripts')
+<x-pwa-install-banner />
 </body>
 </html>

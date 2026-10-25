@@ -103,8 +103,8 @@ class ReportController extends Controller
 
         // Revenue by month
         $monthlyRevenue = Shipment::select(
-                DB::raw('YEAR(created_at) as year'),
-                DB::raw('MONTH(created_at) as month'),
+                DB::raw(\App\Support\SqlDate::year().' as year'),
+                DB::raw(\App\Support\SqlDate::month().' as month'),
                 DB::raw('SUM(total_amount) as total')
             )
             ->groupBy('year', 'month')

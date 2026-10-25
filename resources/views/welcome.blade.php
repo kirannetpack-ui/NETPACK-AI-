@@ -7,8 +7,7 @@
     <title>COURIER with NETPACK — Courier &amp; logistics from Nepal</title>
     @vite(['resources/css/app.css', 'resources/js/app.js'])
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
-    <link rel="manifest" href="/manifest.json">
-    <meta name="theme-color" content="#142b3a">
+    <x-pwa-head />
 </head>
 <body class="np-system">
 @if(config('deployment.mode') === 'public-preview')
@@ -91,5 +90,6 @@
 @if(config('deployment.mode') !== 'public-preview')
 <x-ai-copilot-widget />
 @endif
+<x-pwa-install-banner />
 </body>
 </html>

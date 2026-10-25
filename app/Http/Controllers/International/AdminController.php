@@ -87,9 +87,8 @@ class AdminController extends Controller
             ->limit(5)
             ->get();
 
-        $isSqlite = DB::connection()->getDriverName() === 'sqlite';
-        $yearExpr = $isSqlite ? "strftime('%Y', created_at)" : 'YEAR(created_at)';
-        $monthExpr = $isSqlite ? "strftime('%m', created_at)" : 'MONTH(created_at)';
+        $yearExpr = \App\Support\SqlDate::year();
+        $monthExpr = \App\Support\SqlDate::month();
 
         $monthlyRevenue = Shipment::whereNotNull('overseas_partner_id')
             ->where('status', 'delivered')
@@ -718,7 +717,7 @@ private function parseSurchargeFile($file)
                 ->orderBy('count', 'desc')
                 ->get(),
             'monthly_revenue' => Shipment::whereNotNull('overseas_partner_id')
-                ->select(\DB::raw('YEAR(created_at) as year, MONTH(created_at) as month, SUM(total_amount) as total'))
+                ->selectRaw(\App\Support\SqlDate::year().' as year, '.\App\Support\SqlDate::month().' as month, SUM(total_amount) as total')
                 ->groupBy('year', 'month')
                 ->orderBy('year', 'desc')
                 ->orderBy('month', 'desc')

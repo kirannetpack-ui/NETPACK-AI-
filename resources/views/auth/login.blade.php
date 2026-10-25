@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>Sign in — COURIER with NETPACK</title>
+    <x-pwa-head />
     @vite(['resources/css/app.css', 'resources/js/app.js'])
 </head>
 <body class="np-system">
@@ -69,5 +70,6 @@ function fillRole(email, password) {
     document.getElementById('password').value = password;
 }
 </script>
+<x-pwa-install-banner />
 </body>
 </html>

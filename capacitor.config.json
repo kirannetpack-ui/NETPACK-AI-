@@ -1,14 +1,13 @@
 {
   "appId": "com.netpack.courier.ai",
-  "appName": "NETPACK AI",
+  "appName": "COURIER with NETPACK",
   "webDir": "public",
   "bundledWebRuntime": false,
   "server": {
-    "url": "https://netpack.com.np",
+    "url": "https://netpack-ai.vercel.app",
     "cleartext": false,
     "allowNavigation": [
-      "netpack.com.np",
-      "*.netpack.com.np"
+      "netpack-ai.vercel.app"
     ]
   },
   "plugins": {

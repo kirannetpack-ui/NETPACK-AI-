@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "node scripts/vercel-build.js",
     "vercel-build": "node scripts/vercel-build.js",
-    "test:pwa": "node --test tests/JavaScript/service-worker.test.cjs"
+    "test:pwa": "node --test tests/JavaScript/service-worker.test.cjs tests/JavaScript/pwa.test.cjs"
   },
   "dependencies": {
     "@libphp/almalinux-9-v85": "^0.0.3",

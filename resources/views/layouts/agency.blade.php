@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Agency Hub Portal - COURIER with NETPACK</title>
+    <x-pwa-head />
     @vite(['resources/css/app.css', 'resources/js/app.js'])
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <!-- QR Scanner Library -->
@@ -46,5 +47,6 @@
     <main class="py-6">
         @yield('content')
     </main>
+<x-pwa-install-banner />
 </body>
 </html>
