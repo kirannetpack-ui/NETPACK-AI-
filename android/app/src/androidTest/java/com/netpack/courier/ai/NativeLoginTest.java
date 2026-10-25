@@ -45,8 +45,10 @@ public class NativeLoginTest {
                 "document.getElementById('password').value='Netpack!Admin#2026';" +
                 "document.getElementById('loginForm').requestSubmit(); true");
             waitFor("location.pathname === '/admin/dashboard' && Boolean(document.getElementById('main-content'))");
-            evaluate("location.reload(); true");
-            waitFor("location.pathname === '/admin/dashboard' && Boolean(document.getElementById('main-content'))");
+            evaluate("document.documentElement.setAttribute('data-before-reload', 'yes'); location.reload(); true");
+            waitFor("location.pathname === '/admin/dashboard' && Boolean(document.getElementById('main-content'))" +
+                " && !document.documentElement.hasAttribute('data-before-reload')" +
+                " && document.documentElement.classList.contains('np-native')");
             assertEquals("true", evaluate("document.documentElement.classList.contains('np-native')"));
         }
     }
