@@ -1,5 +1,5 @@
 <!-- International Service & Gateway Hubs Sidebar (Nordic Light Theme) -->
-<aside id="workspace-navigation" class="netpack-sidebar fixed inset-y-0 left-0 z-50 w-72 max-w-[85vw] lg:w-64 lg:static lg:inset-auto h-screen bg-white text-slate-800 border-r border-slate-200/90 flex-shrink-0 overflow-y-auto custom-scrollbar select-none shadow-2xl lg:shadow-none transition-all duration-300 ease-in-out -translate-x-full lg:translate-x-0"
+<aside id="workspace-navigation" class="netpack-sidebar fixed inset-y-0 left-0 z-50 w-72 max-w-[85vw] h-screen bg-white text-slate-800 border-r border-slate-200/90 flex-shrink-0 overflow-y-auto custom-scrollbar select-none shadow-2xl lg:shadow-none transition-all duration-300 ease-in-out -translate-x-full lg:translate-x-0"
        :class="sidebarOpen ? 'translate-x-0' : '-translate-x-full'">
     <!-- Brand Header -->
     <div class="p-4 border-b border-slate-100 flex items-center justify-between gap-2 bg-slate-50/50">

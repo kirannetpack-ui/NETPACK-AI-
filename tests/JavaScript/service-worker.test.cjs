@@ -53,7 +53,7 @@ test('activation purges old NETPACK caches without deleting another app cache', 
     let result;
     handlers.activate({waitUntil: p => result = p});
     await result;
-    assert.deepEqual(removed, ['netpack-ai-v2.2.0', 'netpack-public-v3']);
+    assert.deepEqual(removed, ['netpack-ai-v2.2.0', 'netpack-public-v3', 'netpack-public-v4']);
 });
 
 test('notification URLs cannot navigate to an external origin', async () => {

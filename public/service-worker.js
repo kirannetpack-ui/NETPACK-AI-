@@ -1,5 +1,5 @@
 /** Public static caching only. Operational actions require a live connection. */
-const CACHE_NAME = 'netpack-public-v4';
+const CACHE_NAME = 'netpack-public-v5';
 const OFFLINE_URL = '/offline.html';
 const STATIC_ASSETS = ['/offline.html', '/manifest.json', '/images/logo-icon.png', '/images/logo.png', '/images/logo.svg', '/images/logo-white.svg'];
 self.addEventListener('install', event => {
@@ -42,7 +42,7 @@ self.addEventListener('fetch', event => {
 // Push Notifications: Real-Time Shipment Status Intelligence
 self.addEventListener('push', (event) => {
     let payload = {
-        title: 'NETPACK AI Status Alert',
+        title: 'COURIER with NETPACK Status Alert',
         body: 'Your shipment status has just been updated.',
         icon: '/images/logo-icon.png',
         badge: '/images/logo-icon.png',

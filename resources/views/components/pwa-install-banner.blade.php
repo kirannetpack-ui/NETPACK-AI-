@@ -28,7 +28,7 @@
             <i class="fas fa-mobile-screen"></i>
         </div>
         <div class="min-w-0 flex-1">
-            <h4 class="text-xs font-bold text-slate-900 leading-tight">NETPACK, on your home screen</h4>
+            <h4 class="text-xs font-bold text-slate-900 leading-tight">COURIER with NETPACK, on your home screen</h4>
             <p class="text-[11px] text-slate-500 leading-snug truncate">Open your courier workspace directly.</p>
         </div>
         <div class="flex items-center gap-1.5 flex-shrink-0">

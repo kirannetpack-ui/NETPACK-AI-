@@ -9,18 +9,13 @@
     <meta name="theme-color" content="#142b3a">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="default">
-    <meta name="apple-mobile-web-app-title" content="NETPACK AI">
+    <meta name="apple-mobile-web-app-title" content="COURIER with NETPACK">
     <link rel="apple-touch-icon" href="/images/logo-icon.png">
     <meta name="mobile-web-app-capable" content="yes">
 
     @vite(['resources/css/app.css', 'resources/js/app.js'])
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <meta name="csrf-token" content="{{ csrf_token() }}">
-    <style>
-        @media (min-width: 1024px) {
-            .netpack-sidebar { position: sticky; top: 0; transform: none !important; margin-left: 0 !important; align-self: flex-start; }
-        }
-    </style>
     @stack('styles')
 </head>
 <body class="np-system netpack-workspace">

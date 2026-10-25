@@ -6,7 +6,7 @@
                 <i class="fas fa-bars" aria-hidden="true"></i>
             </button>
             <div class="min-w-0">
-                <p class="np-topbar-title truncate">@yield('page-title', 'NETPACK Workspace')</p>
+                <p class="np-topbar-title truncate">@yield('page-title', 'COURIER with NETPACK')</p>
                 <p class="np-topbar-subtitle">{{ ucwords(str_replace('_', ' ', auth()->user()?->user_type ?? 'Courier')) }} workspace / Nepal</p>
             </div>
         </div>

@@ -190,6 +190,6 @@ class PersistentSidebarTest extends TestCase
         $this->assertStringNotContainsString('lg:-ml-64', $content);
         $this->assertStringContainsString('-translate-x-full', $content);
         $this->assertStringContainsString('toggleSidebar()', $content);
-        $this->assertStringContainsString('@media (min-width: 1024px)', $content);
+        $this->assertStringNotContainsString('lg:static', $content);
     }
 }
