@@ -1,8 +1,10 @@
-// Register on public, sign-in and workspace pages, including installed webviews.
+// The native shell already provides installation and connection recovery.
+const nativeApp = window.Capacitor?.isNativePlatform?.() === true;
 let installPrompt = null;
 window.netpackInstallAvailable = false;
 
 window.addEventListener('beforeinstallprompt', (event) => {
+    if (nativeApp) return;
     event.preventDefault();
     installPrompt = event;
     window.netpackInstallAvailable = true;
@@ -25,7 +27,7 @@ window.addEventListener('appinstalled', () => {
     window.dispatchEvent(new CustomEvent('pwa-installed'));
 });
 
-if ('serviceWorker' in navigator && window.isSecureContext) {
+if (!nativeApp && 'serviceWorker' in navigator && window.isSecureContext) {
     const register = () => navigator.serviceWorker
         .register('/service-worker.js', { scope: '/', updateViaCache: 'none' })
         .catch((error) => console.warn('Offline support could not start.', error));

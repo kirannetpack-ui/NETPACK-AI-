@@ -1,0 +1,92 @@
+name: Native Android and iOS builds
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'android/**'
+      - 'ios/**'
+      - 'native-shell/**'
+      - 'capacitor.config.json'
+      - 'package*.json'
+      - '.github/workflows/native-builds.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - run: npm ci
+      - run: npx cap sync android
+      - name: Build test APK and unsigned store bundle
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug bundleRelease lintDebug
+      - name: Validate native login in Android emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          profile: pixel_6
+          disable-animations: true
+          script: cd android && ./gradlew --no-daemon connectedDebugAndroidTest
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: netpack-android
+          path: |
+            android/app/build/outputs/apk/debug/*.apk
+            android/app/build/outputs/bundle/release/*.aab
+            android/app/build/reports/
+            android/app/build/outputs/androidTest-results/
+          retention-days: 30
+
+  ios:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Select Xcode 26
+        run: |
+          XCODE_APP=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)
+          test -n "$XCODE_APP"
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          xcodebuild -version
+      - run: npm ci
+      - run: npx cap sync ios
+      - name: Compile simulator application
+        run: |
+          mkdir -p artifacts
+          xcodebuild -project ios/App/App.xcodeproj -scheme App -configuration Debug -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' -derivedDataPath artifacts/ios-simulator CODE_SIGNING_ALLOWED=NO build > artifacts/ios-simulator-build.log 2>&1 || { tail -100 artifacts/ios-simulator-build.log; exit 1; }
+          ditto -c -k --sequesterRsrc --keepParent artifacts/ios-simulator/Build/Products/Debug-iphonesimulator/App.app artifacts/netpack-ios-simulator.zip
+      - name: Compile unsigned device archive
+        run: |
+          xcodebuild -project ios/App/App.xcodeproj -scheme App -configuration Release -destination 'generic/platform=iOS' -archivePath artifacts/netpack-ios-unsigned.xcarchive CODE_SIGNING_ALLOWED=NO archive > artifacts/ios-device-build.log 2>&1 || { tail -100 artifacts/ios-device-build.log; exit 1; }
+          ditto -c -k --sequesterRsrc --keepParent artifacts/netpack-ios-unsigned.xcarchive artifacts/netpack-ios-unsigned-archive.zip
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: netpack-ios
+          path: |
+            artifacts/*.zip
+            artifacts/*.log
+          retention-days: 30

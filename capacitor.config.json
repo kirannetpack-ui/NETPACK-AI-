@@ -1,11 +1,11 @@
 {
   "appId": "com.netpack.courier.ai",
   "appName": "COURIER with NETPACK",
-  "webDir": "public",
-  "bundledWebRuntime": false,
+  "webDir": "native-shell",
   "server": {
     "url": "https://netpack-ai.vercel.app",
     "cleartext": false,
+    "errorPath": "offline.html",
     "allowNavigation": [
       "netpack-ai.vercel.app"
     ]
@@ -14,17 +14,10 @@
     "SplashScreen": {
       "launchShowDuration": 1500,
       "launchAutoHide": true,
-      "backgroundColor": "#F8FAFC",
-      "androidSplashResourceName": "splash",
+      "backgroundColor": "#142B3A",
+      "androidSplashResourceName": "netpack_splash",
       "androidScaleType": "CENTER_CROP",
       "showSpinner": false
-    },
-    "PushNotifications": {
-      "presentationOptions": [
-        "badge",
-        "sound",
-        "alert"
-      ]
     },
     "StatusBar": {
       "style": "DARK",

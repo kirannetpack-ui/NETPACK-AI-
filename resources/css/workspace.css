@@ -24,6 +24,27 @@
 [x-cloak] {
     display: none!important;
 }
+.np-native body {
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+.np-native .netpack-sidebar {
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+.np-native-connection {
+    position: fixed;
+    bottom: env(safe-area-inset-bottom, 0px);
+    left: 0;
+    right: 0;
+    z-index: 100;
+    padding: 12px 20px;
+    background: #7c3524;
+    color: white;
+    text-align: center;
+    font-size: 13px;
+}
+.np-native-connection[hidden] { display: none; }
 .np-system :is(a,button,input,select,textarea):focus-visible,.netpack-workspace :is(a,button,input,select,textarea):focus-visible {
     outline: 3px solid #b56a45;
     outline-offset: 3px;

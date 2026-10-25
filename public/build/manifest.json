@@ -1,4 +1,40 @@
 {
+  "node_modules/@capacitor/app/dist/esm/web.js": {
+    "file": "assets/web-V5EgzUqu.js",
+    "name": "web",
+    "src": "node_modules/@capacitor/app/dist/esm/web.js",
+    "isDynamicEntry": true,
+    "imports": [
+      "resources/js/app.js"
+    ]
+  },
+  "node_modules/@capacitor/browser/dist/esm/web.js": {
+    "file": "assets/web-DDqvVX47.js",
+    "name": "web",
+    "src": "node_modules/@capacitor/browser/dist/esm/web.js",
+    "isDynamicEntry": true,
+    "imports": [
+      "resources/js/app.js"
+    ]
+  },
+  "node_modules/@capacitor/network/dist/esm/web.js": {
+    "file": "assets/web-DsBZNdZ3.js",
+    "name": "web",
+    "src": "node_modules/@capacitor/network/dist/esm/web.js",
+    "isDynamicEntry": true,
+    "imports": [
+      "resources/js/app.js"
+    ]
+  },
+  "node_modules/@capacitor/splash-screen/dist/esm/web.js": {
+    "file": "assets/web-BAa4dP0q.js",
+    "name": "web",
+    "src": "node_modules/@capacitor/splash-screen/dist/esm/web.js",
+    "isDynamicEntry": true,
+    "imports": [
+      "resources/js/app.js"
+    ]
+  },
   "node_modules/leaflet/dist/images/layers-2x.png": {
     "file": "assets/layers-2x-Bpkbi35X.png",
     "src": "node_modules/leaflet/dist/images/layers-2x.png"
@@ -12,15 +48,21 @@
     "src": "node_modules/leaflet/dist/images/marker-icon.png"
   },
   "resources/css/app.css": {
-    "file": "assets/app-zGyIm9ON.css",
+    "file": "assets/app-B0K4Y_v6.css",
     "src": "resources/css/app.css",
     "isEntry": true
   },
   "resources/js/app.js": {
-    "file": "assets/app-BoZIO0dU.js",
+    "file": "assets/app-C0HBLucm.js",
     "name": "app",
     "src": "resources/js/app.js",
     "isEntry": true,
+    "dynamicImports": [
+      "node_modules/@capacitor/app/dist/esm/web.js",
+      "node_modules/@capacitor/browser/dist/esm/web.js",
+      "node_modules/@capacitor/network/dist/esm/web.js",
+      "node_modules/@capacitor/splash-screen/dist/esm/web.js"
+    ],
     "css": [
       "assets/app-CG6DamIu.css"
     ],
